@@ -15,8 +15,6 @@ from shutil import copyfile
 from attrs import define, field, validators, Factory
 
 import parmed
-import openmm
-import openmm.app as openmm_app
 
 # ================== BEGIN COMMENT ===================
 # TODO: remove these structures once seekr3 becomes the default
@@ -321,6 +319,8 @@ class Openmm_system:
         """
         Create a parmed structure from the OpenMM XML parameters.
         """
+        import openmm
+        import openmm.app as openmm_app 
         assert pdb_filename != "", "pdb_filename must be defined."
         assert self.system_filename != "", "system_filename must be defined."
         if os.path.isabs(self.system_filename):

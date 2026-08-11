@@ -72,6 +72,22 @@ STATUS_WRITE_INTERVAL = 5.0  # seconds
 STATUS_FILE_NAME = ".seekrflow_job_status.json"
 STATUS_SCHEMA_VERSION = 1
 
+# Mutable poll interval so batch coordinators can slow background children.
+_runtime_polling_interval: float = POLLING_INTERVAL
+
+
+def get_polling_interval() -> float:
+    """Return the active monitor/scheduler poll interval in seconds."""
+    return _runtime_polling_interval
+
+
+def set_polling_interval(seconds: float) -> None:
+    """Update the active poll interval (used by batch focus switching)."""
+    global _runtime_polling_interval
+    if seconds <= 0:
+        raise ValueError(f"polling interval must be > 0, got {seconds}")
+    _runtime_polling_interval = float(seconds)
+
 
 async def _run_blocking(fn: typing.Callable[..., typing.Any], *args, **kwargs):
     """
@@ -1042,7 +1058,7 @@ class StageWorkflow:
                         print(f"[local-status] stage {self.stage.name}: "
                               f"status check raised (process still alive, "
                               f"will retry): {e}")
-                        await asyncio.sleep(POLLING_INTERVAL)
+                        await asyncio.sleep(get_polling_interval())
                         continue
                     print(f"[local-status] stage {self.stage.name}: status "
                           f"check raised and process not alive: {e}")
@@ -1087,7 +1103,7 @@ class StageWorkflow:
                         f"[remote-status] stage {self.stage.name}: "
                         f"status call raised an exception: {e}"
                     )
-                    await asyncio.sleep(POLLING_INTERVAL)
+                    await asyncio.sleep(get_polling_interval())
                     continue
                 if status is not None:
                     self.last_raw_status = status
@@ -1136,7 +1152,7 @@ class StageWorkflow:
                                 f"scheduler; not counting toward grace "
                                 f"(will retry): {display_err}"
                             )
-                        await asyncio.sleep(POLLING_INTERVAL)
+                        await asyncio.sleep(get_polling_interval())
                         continue
                     self.state = stage_status.get("state", self.state)
                     self.progress = stage_status.get(
@@ -1221,7 +1237,7 @@ class StageWorkflow:
                             f"forcing manager=idle")
                         self.manager_status = "idle"
                         break
-                    await asyncio.sleep(POLLING_INTERVAL)
+                    await asyncio.sleep(get_polling_interval())
                     continue
                 if self.resource_name != "local":
                     self.manager_status = "idle"
@@ -1233,7 +1249,7 @@ class StageWorkflow:
                           f"setting semaphore=wait")
                 break
             else:
-                await asyncio.sleep(POLLING_INTERVAL)
+                await asyncio.sleep(get_polling_interval())
         self.task = None
         return
 
@@ -1457,6 +1473,7 @@ class SeekrPipeline:
     semaphore_overrides: dict[str, str] = attrs.field(factory=dict)
     benchmark_stage: str | None = attrs.field(default=None)
     keystrokes_enabled: bool = attrs.field(default=True)
+    batch_child_mode: bool = attrs.field(default=False)
     _input_buffer: str = attrs.field(default="", repr=False)
     _live_display: typing.Any = attrs.field(default=None, repr=False)
     _detached_requested: bool = attrs.field(default=False, repr=False)
@@ -1465,6 +1482,7 @@ class SeekrPipeline:
         default=None, repr=False)
     _stop_event: asyncio.Event | None = attrs.field(
         default=None, repr=False)
+    _batch_commands_offset: int = attrs.field(default=0, repr=False)
 
     def __attrs_post_init__(
             self, 
@@ -1866,6 +1884,57 @@ class SeekrPipeline:
         else:
             print(f"[keystroke] unknown command: {cmd!r}. Type 'h' for help.")
 
+    def apply_batch_command(self, command: dict) -> None:
+        """
+        Apply one command from the batch command file (or future GUI daemon).
+        """
+        kind = command.get("cmd")
+        if kind == "semaphore":
+            value = command.get("value")
+            if value not in {"go", "wait", "stop"}:
+                print(f"[batch-cmd] invalid semaphore value: {value!r}")
+                return
+            self.set_semaphore(command.get("stage"), value)
+        elif kind == "detach":
+            self.detach()
+        elif kind == "transfer":
+            self.request_transfer(command.get("stage"))
+        elif kind == "set_poll_interval":
+            try:
+                set_polling_interval(float(command["seconds"]))
+                print(
+                    f"[batch-cmd] poll interval set to "
+                    f"{get_polling_interval():.1f}s")
+            except (KeyError, TypeError, ValueError) as e:
+                print(f"[batch-cmd] invalid set_poll_interval: {e}")
+        else:
+            print(f"[batch-cmd] unknown command: {kind!r}")
+
+    async def _batch_command_loop(self, stop_event: asyncio.Event) -> None:
+        """
+        Poll work/run/batch_commands.jsonl for coordinator/GUI commands.
+        Always active in batch_child_mode; also useful if the file appears
+        while a normal run is attached.
+        """
+        import seekrflow.modules.batch.commands as batch_commands
+        run_dir = str(self.seekrflow.get_run_directory())
+        path = batch_commands.batch_commands_path(run_dir)
+        while not stop_event.is_set():
+            try:
+                cmds, self._batch_commands_offset = (
+                    batch_commands.read_new_commands(
+                        path, self._batch_commands_offset))
+                for cmd in cmds:
+                    self.apply_batch_command(cmd)
+            except Exception as e:
+                print(f"[batch-cmd] error reading command file: {e}")
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(), get_polling_interval())
+            except asyncio.TimeoutError:
+                pass
+        return
+
     async def _keystroke_loop(self, stop_event: asyncio.Event) -> None:
         """
         Watch stdin for character-buffered keystroke commands until stop_event
@@ -1966,6 +2035,8 @@ class SeekrPipeline:
         overwritten between refreshes.
         """
         try:
+            if self.batch_child_mode:
+                return
             if not sys.stdout.isatty():
                 return
         except Exception:
@@ -1983,7 +2054,7 @@ class SeekrPipeline:
                 self._refresh_live_display()
                 try:
                     await asyncio.wait_for(
-                        stop_event.wait(), POLLING_INTERVAL)
+                        stop_event.wait(), get_polling_interval())
                 except asyncio.TimeoutError:
                     pass
             self._refresh_live_display()
@@ -2067,6 +2138,8 @@ class SeekrPipeline:
             self._keystroke_loop(stop_event))
         live_display_task = asyncio.create_task(
             self._live_display_loop(stop_event))
+        batch_cmd_task = asyncio.create_task(
+            self._batch_command_loop(stop_event))
         #monitor_task = asyncio.create_task(poll_job_status(self.telemetry, stop_event))
 
         try:
@@ -2193,13 +2266,14 @@ class SeekrPipeline:
 
                 if all_terminal:
                     break
-                await asyncio.sleep(POLLING_INTERVAL)
+                await asyncio.sleep(get_polling_interval())
         finally:
             # Stop the background monitor, keystroke watcher, and live display
             stop_event.set()
             await status_task
             await keystroke_task
             await live_display_task
+            await batch_cmd_task
 
         if (not self._detached_requested) and len(launched_tasks) > 0:
             await asyncio.gather(*launched_tasks, return_exceptions=True)
@@ -2226,15 +2300,22 @@ async def launch_seekr_pipeline(
     semaphore_overrides: dict[str, str] | None = None,
         benchmark_stage: str | None = None,
         keystrokes_enabled: bool = True,
+        batch_child_mode: bool = False,
+        polling_interval: float | None = None,
         ) -> None:
     backend = await LocalExecutionBackend(ThreadPoolExecutor())
     workflow_engine = await WorkflowEngine.create(backend=backend)
+    if polling_interval is not None:
+        set_polling_interval(polling_interval)
+    if batch_child_mode:
+        keystrokes_enabled = False
     pipeline = SeekrPipeline(
         model, seekrflow, workflow_engine,
         force_rerun_stages=force_rerun_stages or set(),
         semaphore_overrides=semaphore_overrides or {},
         benchmark_stage=benchmark_stage,
-        keystrokes_enabled=keystrokes_enabled)
+        keystrokes_enabled=keystrokes_enabled,
+        batch_child_mode=batch_child_mode)
     await pipeline.run_workflows()
     return
 
@@ -2247,6 +2328,8 @@ def run_model(
         placement_resource_overrides: dict[str, str] | None = None,
         semaphore_dict: dict[str, str] | None = None,
         keystrokes_enabled: bool = True,
+        batch_child_mode: bool = False,
+        polling_interval: float | None = None,
         ) -> None:
     """
     Run the SEEKR calculation using remote, cloud, or local resources.
@@ -2435,7 +2518,9 @@ def run_model(
     asyncio.run(launch_seekr_pipeline(
         model, seekrflow, force_rerun_stages, semaphore_dict,
         benchmark_stage,
-        keystrokes_enabled=keystrokes_enabled))
+        keystrokes_enabled=keystrokes_enabled,
+        batch_child_mode=batch_child_mode,
+        polling_interval=polling_interval))
 
     if perform_final_transfer:
         detached_requested = False

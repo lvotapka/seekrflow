@@ -25,6 +25,8 @@ def flow(
         resource_dict: dict[str, str] | None = None,
         keystrokes_enabled: bool = True,
         skip_checks: bool = False,
+        batch_child_mode: bool = False,
+        polling_interval: float | None = None,
         ) -> None:
     """
     Execute the instructed seekrflow stage.
@@ -64,7 +66,9 @@ def flow(
             benchmark_stage=benchmark_stage,
             placement_resource_overrides=resource_dict,
             semaphore_dict=semaphore_dict,
-            keystrokes_enabled=keystrokes_enabled)
+            keystrokes_enabled=keystrokes_enabled,
+            batch_child_mode=batch_child_mode,
+            polling_interval=polling_interval)
 
 
 def main():
@@ -137,6 +141,16 @@ def main():
         "non-interactive runs, GUI integration, or when stdin is not a TTY. "
         "Default: keystrokes enabled when stdin is a TTY.")
     argparser.add_argument(
+        "--batch-child", dest="batch_child", action="store_true",
+        default=False,
+        help="Run as a headless batch child: no Live table, no keystrokes, "
+        "consume work/run/batch_commands.jsonl. Used by batch.py.")
+    argparser.add_argument(
+        "--poll-interval", dest="poll_interval",
+        metavar="SECONDS", type=float, default=None,
+        help="Override the monitor polling interval in seconds. Used by "
+        "batch.py to slow background systems.")
+    argparser.add_argument(
         "--semaphore", dest="semaphore",
         metavar="STAGE_CONTROL", type=str, default=None,
         help="Control stage execution. Format: 'stage:value,stage:value,...' "
@@ -173,6 +187,10 @@ def main():
     force_rerun = args["force_rerun"]
     benchmark = args["benchmark"]
     keystrokes_enabled = not args["no_keystrokes"]
+    batch_child_mode = bool(args["batch_child"])
+    if batch_child_mode:
+        keystrokes_enabled = False
+    polling_interval = args["poll_interval"]
     skip_checks = args["skip_checks"]
 
     semaphore_dict = {}
@@ -263,6 +281,8 @@ def main():
          resource_dict=resource_dict,
          keystrokes_enabled=keystrokes_enabled,
          skip_checks=skip_checks,
+         batch_child_mode=batch_child_mode,
+         polling_interval=polling_interval,
          )
 
 

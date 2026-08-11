@@ -1,4 +1,16 @@
 # batch_job.py
+#
+# Legacy sequential API example. Prefer the batch JSON runner:
+#
+#   python -m seekrflow.batch prepare -i batch_host_guest.json
+#   python -m seekrflow.batch run -i batch_host_guest.json
+#   python -m seekrflow.batch analyze -i batch_host_guest.json
+#
+# or:
+#
+#   python -m seekrflow.batch any -i batch_host_guest.json
+#
+# See batch_host_guest.json for template + per-system overrides.
 
 import os
 import seekrflow.modules.base as seekrflow_base
@@ -10,11 +22,11 @@ import seekrflow.flow as seekrflow_flow
 
 # ["name", "parm7 filename", "pdb filename", "ligand pqr filename"]
 job_list = [
-["ligand_1", "BCD_1-butanol.parm7", "BCD_1-butanol.pdb", 
+["ligand_1", "BCD_1-butanol.parm7", "BCD_1-butanol.pdb",
     "BCD_1-butanol_ligand.pqr"],
-["ligand_2", "BCD_1-naphthylethanol.parm7", "BCD_1-naphthylethanol.pdb", 
+["ligand_2", "BCD_1-naphthylethanol.parm7", "BCD_1-naphthylethanol.pdb",
     "BCD_1-naphthylethanol_ligand.pqr"],
-["ligand_3", "BCD_1-propanol.parm7", "BCD_1-propanol.pdb", 
+["ligand_3", "BCD_1-propanol.parm7", "BCD_1-propanol.pdb",
     "BCD_1-propanol_ligand.pqr"]]
 
 input_json = "seekrflow_1_butanol.json"
@@ -32,7 +44,7 @@ for name, parm7, pdb, pqr in job_list:
         "../params_and_structures", pqr)
     seekrflow.workflow.parameterizer_information.receptor_ligand_pdb_filename\
         = os.path.join(
-            "../params_and_structures", pdb)    
+            "../params_and_structures", pdb)
     seekrflow.make_work_directory()
     curdir = os.getcwd()
     os.chdir(seekrflow.work_directory)
@@ -40,8 +52,7 @@ for name, parm7, pdb, pqr in job_list:
         seekrflow, "")
     os.chdir(curdir)
     seekrflow.workflow.ligand_indices = seekrflow_base.get_ligand_indices(
-        os.path.join("params_and_structures", pdb), 
+        os.path.join("params_and_structures", pdb),
         seekrflow.workflow.parameterizer_information.ligand_resname)
     seekrflow_flow.flow(seekrflow, "prepare", src_pdb_filename)
     seekrflow_flow.flow(seekrflow, "run")
-    

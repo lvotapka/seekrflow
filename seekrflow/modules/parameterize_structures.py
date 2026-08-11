@@ -8,7 +8,6 @@ import os
 import typing
 
 from attrs import define, field, validators, Factory
-import openmm.app as openmm_app
 
 # Canonical outputs written under work/parameterize/
 COMPLEX_SYSTEM_XML = "complex_system.xml"
@@ -29,6 +28,7 @@ def describe_pdb_chains(pdb_filename: str) -> list[dict]:
         import mdtraj
         traj = mdtraj.load(pdb_filename)
     except Exception:
+        import openmm.app as openmm_app
         pdb = openmm_app.PDBFile(pdb_filename)
         chains_info = []
         for i, chain in enumerate(pdb.topology.chains()):
@@ -116,6 +116,7 @@ class PDBFixer_settings:
         Run PDBFixer on the given PDB file and write the fixed PDB.
         """
         from pdbfixer import PDBFixer
+        import openmm.app as openmm_app
         fixer = PDBFixer(filename=input_pdb_filename)
         num_chains = len(list(fixer.topology.chains()))
         if self.keep_chain_indices is not None:
