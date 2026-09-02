@@ -12,6 +12,21 @@ import seekrflow.modules.transfer.globus as transfer_globus
 import seekrflow.modules.transfer.rsync as transfer_rsync
 import seekrflow.modules.transfer.aws_s3 as transfer_aws_s3
 
+
+def is_retryable_transfer_error(error: BaseException) -> bool:
+    """
+    True when a failed transfer is worth retrying automatically.
+
+    Callers use this to keep a stage queued for another attempt instead of
+    parking it behind a ``wait`` semaphore that needs manual intervention.
+    HTTP 0 / network blips are retryable even when already wrapped as a
+    ``GlobusTransferError``.
+    """
+    if isinstance(error, transfer_globus.GlobusTransferRetryableError):
+        return True
+    return transfer_globus.sdk_error_is_retryable(error)
+
+
 def transfer_files_to_from_remote_resource(
         remote_root_directory_name: str,
         resource: structures.Resource_base,

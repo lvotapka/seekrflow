@@ -28,7 +28,11 @@ def slurm_remote_status_workflow(args):
 
     Args format:
         [working_dir, stage_name, benchmark_mode=False, anchor="any",
-         swarm_id=None, worker_init=""]
+         swarm_id=None, worker_init="", job_name=""]
+
+    job_name is the SLURM -J name (``{seekrflow}_{stage}``). When the
+    ``.slurm_runner`` state file is missing, status still queries
+    ``squeue -n`` so a resume cannot miss a live job.
 
     worker_init is a bash snippet that activates the env which has the
     `seekr` package installed (e.g. "source ~/.bashrc; conda activate SEEKR2").
@@ -40,6 +44,7 @@ def slurm_remote_status_workflow(args):
     import json
     import time
     import shlex
+    import os
     import pathlib
     import subprocess
     from dataclasses import dataclass
@@ -64,6 +69,7 @@ def slurm_remote_status_workflow(args):
     anchor = args[3] if len(args) > 3 else "any"
     swarm_id = args[4] if len(args) > 4 else None
     worker_init = args[5] if len(args) > 5 else ""
+    job_name = args[6] if len(args) > 6 else None
 
     @dataclass
     class RunState:
@@ -129,6 +135,29 @@ def slurm_remote_status_workflow(args):
             )
         return out.returncode, out.stdout.strip(), out.stderr.strip()
 
+    def parse_squeue_rows(output: str) -> list:
+        rows = []
+        for line in (output or "").splitlines():
+            parts = line.split("|")
+            if len(parts) >= 9:
+                rows.append(
+                    {
+                        "JobID": parts[0],
+                        "Partition": parts[1],
+                        "Name": parts[2],
+                        "User": parts[3],
+                        "State": parts[4],
+                        "Elapsed": parts[5],
+                        "TimeLimit": parts[6],
+                        "Nodes": parts[7],
+                        "CPUs": parts[8],
+                        "Reason": parts[9] if len(parts) > 9 else "",
+                    }
+                )
+        return rows
+
+    squeue_fmt = "%i|%P|%j|%u|%T|%M|%l|%D|%C|%R"
+
     work_dir = pathlib.Path(working_dir)
     manager_status = {
         "tool": "squeue",
@@ -139,32 +168,21 @@ def slurm_remote_status_workflow(args):
     last_known_elapsed = None
 
     state_path = find_latest_state_file(work_dir, stage_name)
-    if state_path is not None and state_path.exists():
+    if state_path is None:
+        manager_status["error"] = (
+            f"No SLURM state file found for stage {stage_name!r} under "
+            f"{get_state_dir(work_dir)}"
+        )
+    elif state_path is not None and state_path.exists():
         try:
             st = RunState.load(state_path)
-            cmd = f"squeue -j {st.jobid} -h -o '%i|%P|%j|%u|%T|%M|%l|%D|%C|%R'"
+            if not job_name:
+                job_name = getattr(st, "name", None)
+            cmd = f"squeue -j {st.jobid} -h -o '{squeue_fmt}'"
             rc, out, err = run(["bash", "-lc", cmd], check=False)
 
             if rc == 0:
-                rows = []
-                for line in out.splitlines():
-                    parts = line.split("|")
-                    if len(parts) >= 9:
-                        rows.append(
-                            {
-                                "JobID": parts[0],
-                                "Partition": parts[1],
-                                "Name": parts[2],
-                                "User": parts[3],
-                                "State": parts[4],
-                                "Elapsed": parts[5],
-                                "TimeLimit": parts[6],
-                                "Nodes": parts[7],
-                                "CPUs": parts[8],
-                                "Reason": parts[9] if len(parts) > 9 else "",
-                            }
-                        )
-
+                rows = parse_squeue_rows(out)
                 if rows:
                     last_known_elapsed = rows[0].get("Elapsed")
                     try:
@@ -173,10 +191,10 @@ def slurm_remote_status_workflow(args):
                         state_path.write_text(json.dumps(state_data, indent=2))
                     except Exception:
                         pass
-
                 manager_status["jobs"] = rows
             else:
-                manager_status["error"] = err
+                manager_status["error"] = err or (
+                    f"squeue failed for job {st.jobid} (rc={rc})")
                 try:
                     state_data = json.loads(state_path.read_text())
                     last_known_elapsed = state_data.get("last_known_elapsed")
@@ -184,6 +202,22 @@ def slurm_remote_status_workflow(args):
                     pass
         except Exception as e:
             manager_status["error"] = f"Failed to check SLURM status: {e}"
+
+    if not manager_status["jobs"] and job_name:
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        user_part = f"-u {shlex.quote(user)} " if user else ""
+        cmd = (
+            f"squeue -n {shlex.quote(str(job_name))} {user_part}"
+            f"-h -o '{squeue_fmt}'"
+        )
+        rc, out, err = run(["bash", "-lc", cmd], check=False)
+        if rc == 0:
+            rows = parse_squeue_rows(out)
+            manager_status["jobs"] = rows
+            manager_status["error"] = ""
+        elif not manager_status["error"]:
+            manager_status["error"] = err or (
+                f"squeue -n {job_name!r} failed (rc={rc})")
 
     def _progress_from_stage_progress(stage_progress: dict, partitioned_anchor) -> float:
         progress_map = stage_progress.get("progress", {})
@@ -224,9 +258,11 @@ def slurm_remote_status_workflow(args):
                 "model_xml_found": False,
             }
         )
+        # Unclean: callers must not treat this as an authoritative stage
+        # state (model may still be transferring while jobs are queued).
         return {
-            "success": True,
-            "error": None,
+            "success": False,
+            "error": stage_status["notes"],
             "manager_status": manager_status,
             "stage_status": stage_status,
             "last_known_elapsed": last_known_elapsed,

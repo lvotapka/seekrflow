@@ -330,6 +330,7 @@ def _make_input_stage(
         stage.name = item.name
         stage.input_stage_name = input_stage_name
         stage.reporter_name = item.reporter_name
+        stage.number_of_velocity_resamples = item.number_of_velocity_resamples
         return stage
     raise ValueError(f"Unknown stage item {type(item).__name__}.")
 

@@ -9,6 +9,7 @@ import sys
 import time
 import json
 import glob
+import random
 import typing
 import select
 import signal
@@ -43,6 +44,8 @@ import seekr.status as seekr_status
 import seekrflow.modules.base as base
 import seekrflow.modules.structures as structures
 import seekrflow.modules.transfer.base as transfer_base
+import seekrflow.modules.transfer.globus as transfer_globus
+import seekrflow.modules.remote_interfaces.globus_compute_sdk as globus_compute_sdk
 import seekrflow.modules.workload_managers.local_multiprocessing as workload_local_mp
 import seekrflow.modules.workload_managers.remote as workload_remote
 import seekrflow.modules.workload_managers.aws as workload_aws
@@ -66,19 +69,109 @@ IDLE_INCOMPLETE_POLL_INTERVAL = 30.0  # seconds
 COMPLETED_DRAIN_CHECKS = 3
 SHUTDOWN_CANCEL_TIMEOUT = 30.0
 ENGINE_SHUTDOWN_TIMEOUT = 15.0
+# Hard ceiling from the first stop signal to process death. Must exceed the two
+# timeouts above plus slack; enforced by a signal-level timer so it holds even
+# if the event loop is wedged and never runs the graceful handler.
+HARD_EXIT_TIMEOUT = SHUTDOWN_CANCEL_TIMEOUT + ENGINE_SHUTDOWN_TIMEOUT + 30.0
+
+# A monitor whose launching shell or coordinator has died keeps polling remote
+# endpoints forever with nobody watching. After this long it detaches itself,
+# leaving submitted jobs running for a later run to reattach to.
+ORPHAN_GRACE_SECONDS = 1800.0
+ORPHAN_CHECK_INTERVAL = 30.0
 
 POLLING_INTERVAL = 5.0  # seconds
 STATUS_WRITE_INTERVAL = 5.0  # seconds
+# How often batch children check batch_commands.jsonl. Must stay short so
+# focus / set_poll_interval commands are picked up even when the monitor
+# poll interval is large (background systems).
+BATCH_COMMAND_POLL_INTERVAL = 1.0  # seconds
 STATUS_FILE_NAME = ".seekrflow_job_status.json"
 STATUS_SCHEMA_VERSION = 1
+# Cap/duplicate status submits are not "we learned something"; retry soon
+# so a freed Globus worker is claimed instead of sitting idle for 300s.
+STATUS_CONTENTION_RETRY_S = 5.0
+POLL_SUCCESS_JITTER_FRAC = 0.2
 
 # Mutable poll interval so batch coordinators can slow background children.
 _runtime_polling_interval: float = POLLING_INTERVAL
+# Set when poll interval changes so long monitor sleeps wake early.
+_poll_wake_event: asyncio.Event | None = None
+_poll_wake_loop: asyncio.AbstractEventLoop | None = None
 
 
 def get_polling_interval() -> float:
     """Return the active monitor/scheduler poll interval in seconds."""
     return _runtime_polling_interval
+
+
+def _globus_status_kind() -> str:
+    """Focused rows poll at POLLING_INTERVAL; background rows are slower."""
+    if get_polling_interval() <= POLLING_INTERVAL + 1e-6:
+        return "status_focused"
+    return "status"
+
+
+def submit_failure_is_capacity(error: BaseException) -> bool:
+    """
+    True when a submit failed only because the resource had no room yet.
+
+    Capacity pressure on a shared endpoint is routine and self-resolving, so it
+    must leave the stage queued for another attempt. A ``wait`` semaphore is
+    reserved for failures that need a human, such as a bad payload or an
+    endpoint that is offline.
+    """
+    return globus_compute_sdk.is_retryable_globus_error(error)
+
+
+def should_reattach_queued_jobs(stage_workflow: typing.Any) -> bool:
+    """
+    True when ``queued`` is a stale label on jobs that were already submitted.
+
+    Capacity-wait ``queued`` has empty ``job_ids`` and should relaunch via
+    ``create_tasks``. Queued with job ids must monitor (and idle-resubmit)
+    rather than sbatch again.
+    """
+    return (
+        getattr(stage_workflow, "state", None) == "queued"
+        and bool(getattr(stage_workflow, "job_ids", None))
+        and getattr(stage_workflow, "resource_name", None) != "local"
+    )
+
+
+def should_reattach_started_jobs(stage_workflow: typing.Any) -> bool:
+    """
+    True when a restored ``started`` remote stage already has tracked jobs.
+
+    Without this, a resume leaves ``started`` with no monitor and never
+    probes or pulls results back.
+    """
+    return (
+        getattr(stage_workflow, "state", None) == "started"
+        and bool(getattr(stage_workflow, "job_ids", None))
+        and getattr(stage_workflow, "resource_name", None) != "local"
+    )
+
+
+def fusion_host_needs_relaunch(
+        stage_workflow: typing.Any,
+        stage_by_name: dict,
+        ) -> bool:
+    """
+    True when a fusion host is marked completed but a lumped member is not.
+
+    The host owns the combined job; skipping it leaves the incomplete tail
+    with no submitter.
+    """
+    if not is_fusion_host(stage_workflow):
+        return False
+    if getattr(stage_workflow, "state", None) != "completed":
+        return False
+    try:
+        return not co_schedule_fusion.fused_set_completed(
+            stage_workflow.stage.name, stage_by_name)
+    except KeyError:
+        return False
 
 
 def set_polling_interval(seconds: float) -> None:
@@ -87,6 +180,42 @@ def set_polling_interval(seconds: float) -> None:
     if seconds <= 0:
         raise ValueError(f"polling interval must be > 0, got {seconds}")
     _runtime_polling_interval = float(seconds)
+    if _poll_wake_event is not None:
+        try:
+            _poll_wake_event.set()
+        except RuntimeError:
+            # Event bound to a closed/other loop (e.g. between tests).
+            pass
+
+
+async def _sleep_polling_interval(*, jitter: bool = False) -> None:
+    """
+    Sleep for the current poll interval, but wake early if the interval is
+    changed (e.g. batch focus switched via set_poll_interval).
+    """
+    global _poll_wake_event, _poll_wake_loop
+    seconds = get_polling_interval()
+    if jitter and POLL_SUCCESS_JITTER_FRAC > 0 and seconds > 0:
+        seconds *= (1.0 + random.random() * POLL_SUCCESS_JITTER_FRAC)
+    loop = asyncio.get_running_loop()
+    if _poll_wake_event is None or _poll_wake_loop is not loop:
+        _poll_wake_event = asyncio.Event()
+        _poll_wake_loop = loop
+    _poll_wake_event.clear()
+    try:
+        await asyncio.wait_for(_poll_wake_event.wait(), seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def _sleep_drain_interval() -> None:
+    """
+    Short pause between completed-drain probes.
+
+    Must not use the background poll interval (often 300s); drain only
+    confirms squeue is empty after seekr already reported finished.
+    """
+    await asyncio.sleep(POLLING_INTERVAL)
 
 
 async def _run_blocking(fn: typing.Callable[..., typing.Any], *args, **kwargs):
@@ -111,6 +240,7 @@ mark_fused_set_completed = co_schedule_fusion.mark_fused_set_completed
 classify_fused_probe_status = co_schedule_fusion.classify_fused_probe_status
 remote_scheduler_job_name = remote_stage_lifecycle.remote_scheduler_job_name
 classify_remote_probe_status = remote_stage_lifecycle.classify_remote_probe_status
+remote_model_missing = remote_stage_lifecycle.remote_model_missing
 owns_scheduler_job = remote_stage_lifecycle.owns_scheduler_job
 remote_cancel_needed = remote_stage_lifecycle.remote_cancel_needed
 force_overwrite_skips_launch_probe = (
@@ -431,6 +561,59 @@ def load_job_status(root_directory: str) -> dict:
     with open(path, "r") as f:
         return json.load(f)
 
+
+def write_job_status(root_directory: str, data: dict) -> None:
+    """Atomically replace the job status snapshot."""
+    os.makedirs(root_directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=root_directory, prefix=".seekrflow_job_status.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=4, default=str)
+        os.replace(tmp_path, os.path.join(root_directory, STATUS_FILE_NAME))
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
+def patch_completed_remote_transfer(
+        root_directory: str,
+        *,
+        transfer_status: str,
+        transfer_direction: str | None,
+        ) -> None:
+    """
+    Mark completed remote stages' transfer fields so the batch UI can show
+    the post-pipeline reverse pull.
+    """
+    try:
+        data = load_job_status(root_directory)
+    except (OSError, json.JSONDecodeError, FileNotFoundError):
+        return
+    stages = data.get("stages") or {}
+    changed = False
+    for info in stages.values():
+        if not isinstance(info, dict):
+            continue
+        if info.get("state") != "completed":
+            continue
+        if info.get("resource_name", "local") == "local":
+            continue
+        info["transfer_status"] = transfer_status
+        info["transfer_direction"] = transfer_direction
+        info["status_polled_at"] = time.time()
+        changed = True
+    if not changed:
+        return
+    try:
+        write_job_status(root_directory, data)
+    except OSError as e:
+        print(f"[warning] could not update transfer status: {e}")
+
 def determine_stage_manager_status(manager_status: dict | None) -> str:
     """
     Determine the manager status string based on job states.
@@ -483,32 +666,45 @@ class StageWorkflow:
         default=None, repr=False)
     state: str = attrs.field(
         default="unknown", validator=attrs.validators.in_(
-            {"unknown", "unstarted", "started", "completed", "failed"}))
+            {"unknown", "unstarted", "started", "completed", "failed",
+             "queued"}))
     semaphore: str = attrs.field(
         default="go", validator=attrs.validators.in_({"go", "wait", "stop"}))
+    # Set when this process is shutting down. Halts the monitor loop like a
+    # "stop" semaphore but is never written to the status file, so it cannot
+    # disable the stage on a later run.
+    stopped_for_shutdown: bool = attrs.field(default=False, repr=False)
     progress: float = attrs.field(
         default=0.0, validator=attrs.validators.ge(0.0))
     transfer_from: str | None = attrs.field(default=None)
     manager_status: str = attrs.field(
         default="idle", validator=attrs.validators.in_(
-            {"idle", "running", "queued", "running/queued", "unknown"}))
+            {"idle", "running", "queued", "running/queued", "unknown",
+             "gathering", "pending", "pulling"}))
     job_ids: set[str] = attrs.field(factory=set)
     subsequent_noncompleted_runs: int = attrs.field(default=0)
     last_progress: float = attrs.field(default=0.0)
+    last_completion_fraction: float = attrs.field(default=0.0)
     running_start_time: float | None = attrs.field(default=None)
     quick_failure_warned: bool = attrs.field(default=False)
     force_overwrite: bool = attrs.field(default=False)
     benchmark_mode: bool = attrs.field(default=False)
     detached_requested: bool = attrs.field(default=False)
     transfer_status: str = attrs.field(default="idle")
+    transfer_direction: str | None = attrs.field(default=None)
     transfer_error: str | None = attrs.field(default=None)
+    transfer_relaunch_count: int = attrs.field(default=0)
+    last_error: str | None = attrs.field(default=None)
     last_raw_status: dict | None = attrs.field(default=None, repr=False)
+    status_polled_at: float | None = attrs.field(default=None)
     co_schedule_with: str | None = attrs.field(default=None)
     fusion_host: str | None = attrs.field(default=None)
     fused_before: list[str] = attrs.field(factory=list)
     fused_after: list[str] = attrs.field(factory=list)
     peer_workflows: dict[str, "StageWorkflow"] = attrs.field(
         factory=dict, repr=False)
+    holds_local_slot: bool = attrs.field(default=False)
+    local_slot_file: str | None = attrs.field(default=None, repr=False)
 
     def __attrs_post_init__(self) -> None:
         """
@@ -557,13 +753,18 @@ class StageWorkflow:
 
     async def probe_remote_launch(
             self,
+            resume: bool | None = None,
             ) -> tuple[str, dict | None]:
         """
         One-shot remote probe for fresh launch from ``unstarted`` / ``unknown``.
 
         Returns ``(action, status)`` where action is ``completed``,
-        ``reattach``, or ``submit``.
+        ``reattach``, ``submit``, or ``defer``.
         """
+        if resume is None:
+            resume = bool(self.job_ids) or self.state in {
+                "started", "queued", "completed",
+            }
         if self.resource_name == "local" or self.fusion_host is not None:
             return "submit", None
         if is_fusion_host(self):
@@ -579,14 +780,21 @@ class StageWorkflow:
                         benchmark_mode=self.benchmark_mode,
                         host_stage_name=self.stage.name,
                         announce_failure=False,
+                        globus_kind=_globus_status_kind(),
                     )
                 except Exception as e:
                     print(
                         f"[remote-probe] fused set member {stage_name}: "
-                        f"probe failed ({e}); will submit fresh")
+                        f"probe failed ({e}); not submitting until squeue "
+                        f"can be read"
+                    )
                     member_statuses[stage_name] = None
             action = classify_fused_probe_status(
-                member_statuses, self.stage.name)
+                member_statuses,
+                self.stage.name,
+                tracked_job_ids=self.job_ids,
+                resume=bool(resume),
+            )
             return action, member_statuses.get(self.stage.name)
         try:
             status = await _run_blocking(
@@ -596,13 +804,113 @@ class StageWorkflow:
                 self.model,
                 benchmark_mode=self.benchmark_mode,
                 announce_failure=False,
+                globus_kind=_globus_status_kind(),
             )
         except Exception as e:
             print(
                 f"[remote-probe] stage {self.stage.name}: probe failed "
-                f"({e}); submitting fresh")
-            return "submit", None
-        return classify_remote_probe_status(status), status
+                f"({e}); not submitting until squeue can be read"
+            )
+            if self.job_ids or resume:
+                return "reattach", None
+            return "defer", None
+        return classify_remote_probe_status(
+            status,
+            tracked_job_ids=self.job_ids,
+            resume=bool(resume),
+        ), status
+
+    def apply_transfer_error(self, error: BaseException) -> None:
+        """
+        Record a failed transfer. Retryable errors stay queued with semaphore
+        go, up to a small cap; everything else parks the stage on wait.
+        """
+        self.transfer_status = "failed"
+        self.transfer_error = str(error)
+        if transfer_base.is_retryable_transfer_error(error):
+            self.transfer_relaunch_count += 1
+            cap = transfer_globus.GLOBUS_TRANSFER_MAX_ATTEMPTS
+            if self.transfer_relaunch_count >= cap:
+                self.last_error = (
+                    f"transfer could not be confirmed after {cap} attempts "
+                    f"({error}); files may already be remote")
+                self.semaphore = "wait"
+                self.state = "failed"
+                print(
+                    f"[transfer] stage {self.stage.name} could not confirm "
+                    f"copy after {cap} attempts; setting semaphore=wait. "
+                    f"error={error}"
+                )
+                return
+            self.last_error = f"transfer will be retried: {error}"
+            self.state = "queued"
+            print(
+                f"[transfer] stage {self.stage.name} transfer did not "
+                f"complete ({error}); staying queued "
+                f"({self.transfer_relaunch_count}/{cap}) and will retry."
+            )
+            return
+        self.last_error = f"transfer failed: {error}"
+        self.semaphore = "wait"
+        self.state = "failed"
+        print(
+            f"[transfer] stage {self.stage.name} transfer failed; "
+            f"setting semaphore=wait. error={error}"
+        )
+
+    def _outbound_transfer_resources(self):
+        """Source/destination resources for the outbound copy, or (None, None)."""
+        if self.transfer_from is None:
+            dep_index = getattr(self.stage, "input_stage_index", 0)
+            if self.resource_name != "local" and dep_index <= 0:
+                return None, self.resource
+            return None, None
+        src_resource = self.seekrflow.run_settings.get_resource_by_name(
+            self.transfer_from)
+        return src_resource, self.resource
+
+    def push_files_outbound(self) -> None:
+        """
+        Copy this stage's files to the remote workdir.
+
+        Used both from ``create_tasks`` (before sbatch) and when a resume
+        reattaches to live jobs but the remote model.json is missing.
+        """
+        src_resource, dst_resource = self._outbound_transfer_resources()
+        if src_resource is None and dst_resource is None:
+            self.transfer_status = "skipped"
+            self.transfer_error = None
+            return
+        try:
+            self.transfer_status = "running"
+            self.transfer_direction = "out"
+            self.transfer_error = None
+            self.manager_status = "gathering"
+            # A leftover poll timestamp would make the batch table skip
+            # pending and show the previous run's queued/running labels.
+            self.status_polled_at = None
+            local_directory = self.model.directory
+            if src_resource is not None:
+                transfer_base.transfer_files_to_from_remote_resource(
+                    self.seekrflow.name,
+                    src_resource,
+                    local_directory,
+                    backwards=True,
+                )
+            if dst_resource is not None:
+                transfer_base.transfer_files_to_from_remote_resource(
+                    self.seekrflow.name,
+                    dst_resource,
+                    local_directory,
+                    backwards=False,
+                )
+            self.transfer_status = "completed"
+            self.transfer_direction = None
+            self.manager_status = "idle"
+            self.transfer_relaunch_count = 0
+        except Exception as e:
+            self.apply_transfer_error(e)
+            raise
 
     async def create_tasks(self):
         """
@@ -620,55 +928,12 @@ class StageWorkflow:
                 # from local so model/config files exist before submission.
                 dep_index = getattr(self.stage, "input_stage_index", 0)
                 if self.resource_name != "local" and dep_index <= 0:
-                    src_resource = None
-                    dst_resource = self.resource
+                    pass
                 else:
                     self.transfer_status = "skipped"
                     self.transfer_error = None
                     return
-            else:
-                src_resource = self.seekrflow.run_settings.get_resource_by_name(
-                    self.transfer_from)
-                dst_resource = self.resource
-
-            local_directory = self.model.directory
-
-            if src_resource is None and dst_resource is None:
-                self.transfer_status = "skipped"
-                self.transfer_error = None
-                return
-
-            try:
-                self.transfer_status = "running"
-                self.transfer_error = None
-
-                # Conservative resource hop: remote source -> local -> remote destination.
-                if src_resource is not None:
-                    transfer_base.transfer_files_to_from_remote_resource(
-                        self.seekrflow.name,
-                        src_resource,
-                        local_directory,
-                        backwards=True,
-                    )
-                if dst_resource is not None:
-                    transfer_base.transfer_files_to_from_remote_resource(
-                        self.seekrflow.name,
-                        dst_resource,
-                        local_directory,
-                        backwards=False,
-                    )
-
-                self.transfer_status = "completed"
-            except Exception as e:
-                self.transfer_status = "failed"
-                self.transfer_error = str(e)
-                self.semaphore = "wait"
-                self.state = "failed"
-                print(
-                    f"[transfer] stage {self.stage.name} transfer failed; "
-                    f"setting semaphore=wait. error={e}"
-                )
-                raise
+            self.push_files_outbound()
             
         dep_index = getattr(self.stage, "input_stage_index", 0)
         should_transfer = bool(self.transfer_from) or (
@@ -701,6 +966,22 @@ class StageWorkflow:
                     print(f"  Reattached to {self.stage.name} process (PID: {existing_state.pid})")
                     # self.process remains None - we'll use the PID from state file
                     # TODO: does more need to be done here?
+                    if self.holds_local_slot and self.local_slot_file:
+                        try:
+                            import seekrflow.modules.batch.local_slots as \
+                                local_slots
+                            work_dir = (
+                                self.seekrflow.work_directory
+                                or self.model.directory)
+                            local_slots.update_holder_pid(
+                                self.local_slot_file,
+                                str(work_dir),
+                                self.stage.name,
+                                os.getpid(),
+                                int(existing_state.pid),
+                            )
+                        except Exception as e:
+                            print(f"[local-slot] pid update failed: {e}")
                 else:
                     self.process = multiprocessing.Process(
                         target=workload_local_mp.run_locally,
@@ -711,6 +992,23 @@ class StageWorkflow:
                         },
                     )
                     self.process.start()
+                    if (self.holds_local_slot and self.local_slot_file
+                            and self.process.pid):
+                        try:
+                            import seekrflow.modules.batch.local_slots as \
+                                local_slots
+                            work_dir = (
+                                self.seekrflow.work_directory
+                                or self.model.directory)
+                            local_slots.update_holder_pid(
+                                self.local_slot_file,
+                                str(work_dir),
+                                self.stage.name,
+                                os.getpid(),
+                                int(self.process.pid),
+                            )
+                        except Exception as e:
+                            print(f"[local-slot] pid update failed: {e}")
             else:
                 if self.resource is None:
                     raise Exception(
@@ -971,20 +1269,73 @@ class StageWorkflow:
                                 )
                             persist_work_baselines_for_submit(
                                 self, stages_in_job)
-                        run_result = await _run_blocking(
-                            workload_remote.submit_remote_run_workflow,
-                            self.seekrflow,
-                            self.stage.name,
-                            destination_path,
-                            self.resource,
-                            command_string,
-                            destination_model_filename,
-                            workflow_type=self.stage.name,
-                            indices=indices,
-                            anchor_times=anchor_times_for_submit,
-                            time_limit_override=time_limit_override,
-                            resolved_execution=self.resolved_execution,
-                        )
+
+                        if (not any(force_map.values())
+                                and (self.job_ids or self.progress > 0)):
+                            pre_action, pre_status = (
+                                await self.probe_remote_launch(resume=True))
+                            if pre_action != "submit":
+                                print(
+                                    f"[remote-submit] stage {self.stage.name}: "
+                                    f"aborting sbatch; probe={pre_action} "
+                                    "(live jobs or inconclusive squeue)"
+                                )
+                                if pre_action == "completed":
+                                    self.state = "completed"
+                                    self.progress = 1.0
+                                    return
+                                jobs = remote_stage_lifecycle.jobs_from_status(
+                                    pre_status)
+                                if jobs:
+                                    self.manager_status = (
+                                        determine_stage_manager_status(
+                                            (pre_status or {}).get(
+                                                "manager_status")))
+                                    for job in jobs:
+                                        job_id = job.get("JobID")
+                                        if job_id:
+                                            self.job_ids.add(str(job_id))
+                                self.state = "started"
+                                return
+
+                        def _do_remote_submit():
+                            return workload_remote.submit_remote_run_workflow(
+                                self.seekrflow,
+                                self.stage.name,
+                                destination_path,
+                                self.resource,
+                                command_string,
+                                destination_model_filename,
+                                workflow_type=self.stage.name,
+                                indices=indices,
+                                anchor_times=anchor_times_for_submit,
+                                time_limit_override=time_limit_override,
+                                resolved_execution=self.resolved_execution,
+                            )
+
+                        ri_type = getattr(
+                            getattr(self.resource, "remote_interface", None),
+                            "type", None)
+                        if (ri_type == "globus_compute_sdk"
+                                and os.environ.get("SEEKR_GLOBUS_LOCK_FILE")):
+                            def _on_globus_retry(attempt, msg):
+                                self.last_error = msg
+                                print(
+                                    f"[remote-submit] stage {self.stage.name} "
+                                    f"Globus retry {attempt}/"
+                                    f"{IDLE_INCOMPLETE_CHECKS_BEFORE_ACTION}: "
+                                    f"{msg}"
+                                )
+                            run_result = await _run_blocking(
+                                globus_compute_sdk.run_globus_submit_with_retries,
+                                _do_remote_submit,
+                                max_attempts=IDLE_INCOMPLETE_CHECKS_BEFORE_ACTION,
+                                sleep_s=IDLE_INCOMPLETE_POLL_INTERVAL,
+                                on_retry=_on_globus_retry,
+                            )
+                        else:
+                            run_result = await _run_blocking(
+                                _do_remote_submit)
                     self.last_raw_status = run_result
 
                     if not isinstance(run_result, dict):
@@ -1002,7 +1353,8 @@ class StageWorkflow:
                         )
 
                     self.state = "started"
-                    self.manager_status = "running"
+                    # Do not advertise running before squeue has been seen.
+                    self.manager_status = "pending"
                     job_id = None
                     if run_result is not None:
                         job_id = run_result.get("job_id", run_result.get("jobid"))
@@ -1014,8 +1366,22 @@ class StageWorkflow:
                         )
                 except Exception as e:
                     self.last_raw_status = {"success": False, "error": str(e)}
-                    self.state = "failed"
                     self.manager_status = "idle"
+                    if submit_failure_is_capacity(e):
+                        # Shared endpoints are routinely at capacity. Treat it
+                        # as "waiting for a worker", not a stage failure: the
+                        # scheduler loop re-launches queued stages, whereas
+                        # semaphore=wait would need manual intervention.
+                        self.state = "queued"
+                        self.last_error = f"waiting for endpoint capacity: {e}"
+                        print(
+                            f"[remote-submit] stage {self.stage.name} could "
+                            f"not submit yet ({e}); staying queued and will "
+                            f"retry."
+                        )
+                        raise
+                    self.state = "failed"
+                    self.last_error = f"remote submit failed: {e}"
                     if self.semaphore != "wait":
                         self.semaphore = "wait"
                     print(
@@ -1039,11 +1405,40 @@ class StageWorkflow:
     async def _monitor_stage_loop(self) -> None:
         idle_incomplete_checks = 0
         completed_drain_checks = 0
+        empty_squeue_streak = 0
         remote_scheduler_active = False
         while True:
             if self.detached_requested:
                 break
-            if self.semaphore == "stop":
+            if self.semaphore == "stop" or self.stopped_for_shutdown:
+                break
+            # Sticky failure: create_tasks still attaches monitor_stage even
+            # when run_stage already failed (submit error). Never let status
+            # probes rewrite failed→unstarted or clear last_error.
+            if self.state == "queued":
+                # Capacity wait (empty job_ids): nothing was submitted, so
+                # there is nothing to monitor; the scheduler loop re-launches.
+                # Queued with tracked jobs is a stale label (transfer retry
+                # or a status dump while still waiting on a poll) — keep
+                # watching so idle-incomplete resubmit can run.
+                if not self.job_ids:
+                    break
+                self.state = "started"
+            if self.state == "failed":
+                if self.semaphore != "wait":
+                    self.semaphore = "wait"
+                    print(f"[semaphore] stage {self.stage.name} failed; "
+                          f"setting semaphore=wait")
+                if not self.last_error:
+                    notes = ""
+                    if isinstance(self.last_raw_status, dict):
+                        notes = (
+                            (self.last_raw_status.get("stage_status") or {})
+                            .get("notes")
+                            or self.last_raw_status.get("error")
+                            or "")
+                    self.last_error = str(notes) if notes else (
+                        f"stage {self.stage.name} failed")
                 break
             fused_host_name = None
             if self.resource_name == "local":
@@ -1058,13 +1453,14 @@ class StageWorkflow:
                         print(f"[local-status] stage {self.stage.name}: "
                               f"status check raised (process still alive, "
                               f"will retry): {e}")
-                        await asyncio.sleep(get_polling_interval())
+                        await _sleep_polling_interval()
                         continue
                     print(f"[local-status] stage {self.stage.name}: status "
                           f"check raised and process not alive: {e}")
                     status = None
                 if status is not None:
                     self.last_raw_status = status
+                    self.status_polled_at = time.time()
                 try:
                     workload_local_mp.check_and_raise_if_process_failed(
                         self.stage.name, self.process,
@@ -1072,7 +1468,9 @@ class StageWorkflow:
                 except Exception as e:
                     self.state = "failed"
                     self.manager_status = "idle"
+                    self.last_error = f"local process failed: {e}"
                     print(f"[local-run] stage {self.stage.name} failed:\n{e}")
+                    continue
                 if status is not None and self.state != "failed":
                     self.state = status["stage_status"]["state"]
                     self.progress = status["stage_status"]["progress"]
@@ -1097,43 +1495,88 @@ class StageWorkflow:
                         self.model,
                         benchmark_mode=self.benchmark_mode,
                         host_stage_name=self.fusion_host,
+                        globus_kind=_globus_status_kind(),
                     )
                 except Exception as e:
+                    empty_squeue_streak = 0
+                    if globus_compute_sdk.is_status_contention_error(e):
+                        await asyncio.sleep(STATUS_CONTENTION_RETRY_S)
+                        continue
                     print(
                         f"[remote-status] stage {self.stage.name}: "
                         f"status call raised an exception: {e}"
                     )
-                    await asyncio.sleep(get_polling_interval())
+                    await _sleep_polling_interval()
                     continue
                 if status is not None:
-                    self.last_raw_status = status
+                    status_ok = status.get("success", True)
                     manager_status = status.get("manager_status")
-                    self.manager_status = determine_stage_manager_status(
-                        manager_status)
-                    if manager_status and manager_status.get("jobs"):
-                        for job in manager_status["jobs"]:
+                    jobs = []
+                    if isinstance(manager_status, dict):
+                        jobs = manager_status.get("jobs") or []
+                    # Keep last good probe payload. Live jobs update manager
+                    # status; leftover job_ids do not keep scheduler_active
+                    # after consecutive empty squeue reads. Stamp the poll
+                    # time whenever squeue returned jobs, even if the seekr
+                    # progress half failed.
+                    if status_ok:
+                        self.last_raw_status = status
+                        self.status_polled_at = time.time()
+                    elif jobs:
+                        self.status_polled_at = time.time()
+                    mgr_error = ""
+                    if isinstance(manager_status, dict):
+                        mgr_error = str(manager_status.get("error") or "")
+                    if jobs:
+                        empty_squeue_streak = 0
+                        self.manager_status = determine_stage_manager_status(
+                            manager_status)
+                        for job in jobs:
                             job_id = job.get("JobID")
                             if job_id:
                                 self.job_ids.add(str(job_id))
+                    elif status_ok and not mgr_error:
+                        empty_squeue_streak += 1
+                        if empty_squeue_streak >= COMPLETED_DRAIN_CHECKS:
+                            if self.job_ids:
+                                print(
+                                    f"[remote-idle] stage {self.stage.name}: "
+                                    f"squeue empty for "
+                                    f"{empty_squeue_streak} probes; "
+                                    f"clearing tracked job ids "
+                                    f"{sorted(self.job_ids)}"
+                                )
+                            self.job_ids.clear()
+                            self.manager_status = "idle"
+                        elif not self.job_ids:
+                            self.manager_status = (
+                                determine_stage_manager_status(
+                                    manager_status))
+                    else:
+                        empty_squeue_streak = 0
+                        if status_ok and not self.job_ids:
+                            self.manager_status = (
+                                determine_stage_manager_status(
+                                    manager_status))
+                    if host_sw is not None:
+                        co_schedule_fusion.copy_host_scheduler_onto_member(
+                            self, host_sw)
                     host_active = False
                     if host_sw is not None:
                         host_active = host_sw.manager_status in {
                             "running", "queued", "running/queued",
                         }
-                        if host_sw.job_ids:
-                            self.job_ids.update(host_sw.job_ids)
-                    status_ok = status.get("success", True)
                     stage_status = status.get("stage_status", {})
-                    scheduler_active = self.manager_status in {
-                        "running", "queued", "running/queued",
-                    }
+                    scheduler_active = bool(jobs)
                     if host_sw is not None:
                         scheduler_active = scheduler_active or host_active
                     remote_scheduler_active = scheduler_active
                     if not status_ok:
-                        # Unclean reading: do not fail or count toward
-                        # idle-incomplete grace. Retry until we get a
-                        # successful status payload.
+                        # Unclean reading: do not fail, do not set last_error
+                        # (transient probe noise), and do not count toward
+                        # idle-incomplete grace. Missing model.json with an
+                        # idle queue is different: leftover job ids skipped
+                        # outbound transfer, so drop them and relaunch.
                         remote_err = (
                             status.get("error")
                             or stage_status.get("notes", ""))
@@ -1145,6 +1588,21 @@ class StageWorkflow:
                                 f"progress check failed (job still in "
                                 f"scheduler); will retry: {display_err}"
                             )
+                        elif (
+                                self.fusion_host is None
+                                and remote_model_missing(status)
+                                and self.transfer_status != "running"):
+                            print(
+                                f"[remote-launch] stage {self.stage.name}: "
+                                f"remote model missing with idle scheduler; "
+                                f"clearing stale job ids and relaunching "
+                                f"so files can be transferred"
+                            )
+                            self.job_ids.clear()
+                            self.state = "unstarted"
+                            self.manager_status = "idle"
+                            self.last_error = None
+                            break
                         else:
                             print(
                                 f"[remote-status] stage {self.stage.name}: "
@@ -1152,11 +1610,36 @@ class StageWorkflow:
                                 f"scheduler; not counting toward grace "
                                 f"(will retry): {display_err}"
                             )
-                        await asyncio.sleep(get_polling_interval())
+                        await _sleep_polling_interval()
                         continue
-                    self.state = stage_status.get("state", self.state)
-                    self.progress = stage_status.get(
-                        "progress", self.progress)
+                    new_state = stage_status.get("state", self.state)
+                    # Avoid unstarted/started flap from incomplete remote
+                    # probes while jobs are tracked or still in the queue.
+                    if (new_state == "unstarted"
+                            and (self.job_ids or scheduler_active)
+                            and self.state in {"started", "queued"}):
+                        new_state = "started"
+                    # Never let a probe quietly clear a non-failed→failed
+                    # transition that race-set failed; failed is handled at
+                    # loop top on the next iteration.
+                    if self.state == "failed":
+                        continue
+                    self.state = new_state
+                    new_progress = stage_status.get("progress", self.progress)
+                    # Do not clobber progress with 0.0 from a flaky probe
+                    # while the stage is still active.
+                    if (scheduler_active or self.job_ids) and (
+                            isinstance(new_progress, (int, float))
+                            and float(new_progress) == 0.0
+                            and self.progress > 0.0
+                            and self.state != "completed"):
+                        pass
+                    else:
+                        self.progress = new_progress
+                    # Do not clear last_error on routine healthy probes;
+                    # only clear on completion or explicit relaunch.
+                    if self.state == "completed":
+                        self.last_error = None
                     finished = bool(stage_status.get("finished", False))
                     # Only submit-capable remote stages may resubmit / wait.
                     if self.fusion_host is None:
@@ -1166,14 +1649,27 @@ class StageWorkflow:
                                     fused_host_name,
                                     self.peer_workflows))
                             progress_for_decision = (
-                                co_schedule_fusion.fused_set_progress(
+                                co_schedule_fusion.fused_set_completion_fraction(
                                     fused_host_name,
                                     self.peer_workflows))
+                            last_for_decision = self.last_completion_fraction
                         else:
                             set_incomplete = (
                                 self.state != "completed" and not finished)
                             progress_for_decision = self.progress
+                            last_for_decision = self.last_progress
                         if set_incomplete and not scheduler_active:
+                            if mgr_error:
+                                # Unreliable queue read (e.g. squeue error):
+                                # do not count toward idle-incomplete fail.
+                                print(
+                                    f"[remote-idle] stage {self.stage.name}: "
+                                    f"scheduler empty but manager error "
+                                    f"present; not counting toward grace: "
+                                    f"{mgr_error}"
+                                )
+                                await _sleep_polling_interval()
+                                continue
                             idle_incomplete_checks += 1
                             print(
                                 f"[remote-idle] stage {self.stage.name}: "
@@ -1181,7 +1677,7 @@ class StageWorkflow:
                                 f"(finished={finished}, "
                                 f"state={self.state}, "
                                 f"progress={progress_for_decision:.1%}, "
-                                f"last_progress={self.last_progress:.1%}, "
+                                f"last_progress={last_for_decision:.1%}, "
                                 f"idle_check="
                                 f"{idle_incomplete_checks}/"
                                 f"{IDLE_INCOMPLETE_CHECKS_BEFORE_ACTION})"
@@ -1189,9 +1685,14 @@ class StageWorkflow:
                             if (idle_incomplete_checks
                                     >= IDLE_INCOMPLETE_CHECKS_BEFORE_ACTION):
                                 if (progress_for_decision
-                                        > self.last_progress):
+                                        > last_for_decision):
+                                    if fused_host_name is not None:
+                                        self.last_completion_fraction = (
+                                            progress_for_decision)
                                     self.last_progress = (
-                                        progress_for_decision)
+                                        progress_for_decision
+                                        if fused_host_name is None
+                                        else self.last_progress)
                                     self.subsequent_noncompleted_runs = 0
                                     print(
                                         f"[remote-resubmit] stage "
@@ -1202,6 +1703,11 @@ class StageWorkflow:
                                     )
                                     self.state = "unstarted"
                                     break
+                                msg = (
+                                    "scheduler idle with incomplete stage "
+                                    f"(progress={progress_for_decision:.1%}, "
+                                    "no advance); set wait for review"
+                                )
                                 print(
                                     f"[remote-idle] stage "
                                     f"{self.stage.name}: job gone without "
@@ -1211,6 +1717,7 @@ class StageWorkflow:
                                 )
                                 self.state = "failed"
                                 self.semaphore = "wait"
+                                self.last_error = msg
                                 break
                             await asyncio.sleep(
                                 IDLE_INCOMPLETE_POLL_INTERVAL)
@@ -1237,19 +1744,14 @@ class StageWorkflow:
                             f"forcing manager=idle")
                         self.manager_status = "idle"
                         break
-                    await asyncio.sleep(get_polling_interval())
+                    await _sleep_drain_interval()
                     continue
                 if self.resource_name != "local":
                     self.manager_status = "idle"
-                break
-            elif self.state == "failed":
-                if self.semaphore != "wait":
-                    self.semaphore = "wait"
-                    print(f"[semaphore] stage {self.stage.name} failed; "
-                          f"setting semaphore=wait")
+                self.last_error = None
                 break
             else:
-                await asyncio.sleep(get_polling_interval())
+                await _sleep_polling_interval(jitter=True)
         self.task = None
         return
 
@@ -1273,8 +1775,11 @@ class StageWorkflow:
             "semaphore": self.semaphore,
             "progress": self.progress,
             "transfer_status": self.transfer_status,
+            "transfer_direction": self.transfer_direction,
             "transfer_error": self.transfer_error,
+            "last_error": self.last_error,
             "last_progress": self.last_progress,
+            "last_completion_fraction": self.last_completion_fraction,
             "manager_status": self.manager_status,
             "job_ids": sorted(self.job_ids),
             "force_overwrite": self.force_overwrite,
@@ -1286,6 +1791,7 @@ class StageWorkflow:
             "quick_failure_warned": self.quick_failure_warned,
             "process": process_info,
             "raw_status": self.last_raw_status,
+            "status_polled_at": self.status_polled_at,
         }
 
     def summary_line(self) -> str:
@@ -1302,12 +1808,41 @@ class StageWorkflow:
                 f"progress={progress_str:>7}  manager={self.manager_status:<14}  "
                 f"resource={self.resource_name:<10}  pid={pid}")
 
-    def kill(self) -> None:
+    def release_local_slot(self) -> None:
+        """Release a batch local-stage slot if this stage holds one."""
+        if not self.holds_local_slot or not self.local_slot_file:
+            self.holds_local_slot = False
+            return
+        try:
+            import seekrflow.modules.batch.local_slots as local_slots
+            work_dir = self.seekrflow.work_directory or self.model.directory
+            # Drop by work_directory + stage (any pid for this stage).
+            local_slots.release(
+                self.local_slot_file,
+                str(work_dir),
+                self.stage.name,
+                pid=None,
+            )
+        except Exception as e:
+            print(f"[local-slot] release failed for {self.stage.name}: {e}")
+        self.holds_local_slot = False
+
+    def kill(self, persist_stop: bool = True) -> None:
         """
         Stop this stage's monitor loop and terminate any running job.
         Idempotent; safe to call on stages that never started.
+
+        ``persist_stop=False`` stops the stage for this process only. Process
+        shutdown uses it so the ``stop`` semaphore keeps meaning "the user
+        stopped this stage" -- a persisted stop is restored on the next run, so
+        conflating the two silently turned every stage off after any
+        cancelling shutdown.
         """
-        self.semaphore = "stop"
+        if persist_stop:
+            self.semaphore = "stop"
+        else:
+            self.stopped_for_shutdown = True
+        self.release_local_slot()
         if self.resource_name != "local":
             if self.resource is None:
                 return
@@ -1325,6 +1860,7 @@ class StageWorkflow:
                     self.stage.name,
                     self.model,
                     benchmark_mode=self.benchmark_mode,
+                    globus_kind=_globus_status_kind(),
                 )
             except Exception as e:
                 print(f"Warning: failed to query remote jobs for cancel: {e}")
@@ -1400,6 +1936,7 @@ def _state_text(state: str) -> Text:
         "failed": "bold red",
         "started": "yellow",
         "transferring": "cyan",
+        "queued": "cyan",
         "unstarted": "dim",
         "unknown": "dim",
     }
@@ -1474,6 +2011,8 @@ class SeekrPipeline:
     benchmark_stage: str | None = attrs.field(default=None)
     keystrokes_enabled: bool = attrs.field(default=True)
     batch_child_mode: bool = attrs.field(default=False)
+    local_slot_file: str | None = attrs.field(default=None)
+    orphan_detach: bool = attrs.field(default=True)
     _input_buffer: str = attrs.field(default="", repr=False)
     _live_display: typing.Any = attrs.field(default=None, repr=False)
     _detached_requested: bool = attrs.field(default=False, repr=False)
@@ -1483,6 +2022,9 @@ class SeekrPipeline:
     _stop_event: asyncio.Event | None = attrs.field(
         default=None, repr=False)
     _batch_commands_offset: int = attrs.field(default=0, repr=False)
+    _foreign_writer_warned: bool = attrs.field(default=False, repr=False)
+    _hard_exit_armed: bool = attrs.field(default=False, repr=False)
+    _orphaned_since: float | None = attrs.field(default=None, repr=False)
 
     def __attrs_post_init__(
             self, 
@@ -1493,9 +2035,81 @@ class SeekrPipeline:
         for sw in self.stage_workflows:
             sw.peer_workflows = by_name
         populate_fusion_map(self.stage_workflows, self.benchmark_stage)
+        self._restore_runtime_from_status_file()
         for sw in self.stage_workflows:
             if sw.stage.name in self.semaphore_overrides:
                 sw.semaphore = self.semaphore_overrides[sw.stage.name]
+
+    def _restore_runtime_from_status_file(self) -> None:
+        """
+        Restore semaphores / sticky failures from a prior status snapshot.
+
+        Semaphores default to 'go' on new StageWorkflow objects; without this,
+        a restart would silently clear 'wait'/'stop'. Also restore ``failed``
+        state when semaphore is wait so the UI does not flash failed→unstarted
+        when run_workflows resets every stage to unstarted at startup.
+        """
+        root = getattr(self.model, "directory", None)
+        if not root:
+            return
+        path = os.path.join(root, STATUS_FILE_NAME)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[warning] could not restore status from {path}: {e}")
+            return
+        stages = data.get("stages") or {}
+        for sw in self.stage_workflows:
+            info = stages.get(sw.stage.name)
+            if not isinstance(info, dict):
+                continue
+            sem = info.get("semaphore")
+            # Only restore wait/stop so a restart cannot silently clear them
+            # back to the StageWorkflow default of go.
+            if sem in {"wait", "stop"}:
+                sw.semaphore = sem
+            prev_state = info.get("state")
+            # Keep last known non-idle states so a restart does not flash
+            # started/queued jobs as unstarted (status writer would persist
+            # that flash into the batch table).
+            if prev_state in {"failed", "started", "queued", "completed"}:
+                sw.state = prev_state
+            err = info.get("last_error") or info.get("transfer_error")
+            if err:
+                sw.last_error = str(err)
+            job_ids = info.get("job_ids") or []
+            if job_ids and isinstance(job_ids, list):
+                for jid in job_ids:
+                    if jid:
+                        sw.job_ids.add(str(jid))
+            mgr = info.get("manager_status")
+            allowed_mgr = {
+                "idle", "unknown", "gathering", "pending", "pulling",
+            }
+            # Do not restore running/queued/running/queued or
+            # status_polled_at. Those labels are only valid after this
+            # process polls squeue (or reattaches from a live probe).
+            if mgr in allowed_mgr and sw.state != "failed":
+                sw.manager_status = mgr
+            xfer = info.get("transfer_status")
+            if xfer in {"completed", "skipped", "idle", "failed"}:
+                sw.transfer_status = xfer
+            try:
+                prog = float(info.get("progress", sw.progress) or 0.0)
+                if prog > sw.progress:
+                    sw.progress = prog
+            except (TypeError, ValueError):
+                pass
+            try:
+                frac = float(
+                    info.get("last_completion_fraction", 0.0) or 0.0)
+                if frac > sw.last_completion_fraction:
+                    sw.last_completion_fraction = frac
+            except (TypeError, ValueError):
+                pass
 
     def add_stage(
             self, 
@@ -1572,10 +2186,96 @@ class SeekrPipeline:
         print("\n\n=== Received interrupt signal ===")
         self._shutdown_task = asyncio.create_task(self.shutdown())
 
+    def _install_hard_exit_backstop(self) -> None:
+        """
+        Guarantee that a stop signal ends this process.
+
+        ``loop.add_signal_handler`` dispatches through the event loop, so a
+        wedged loop swallows SIGINT/SIGTERM entirely and only SIGKILL is left --
+        which skips the final status snapshot. These low-level handlers run in
+        the main thread regardless of loop health: the first stop signal arms a
+        timer, and when it fires the process exits no matter what.
+        """
+        if not hasattr(signal, "setitimer"):
+            return
+
+        def _force_exit(_signum, _frame):
+            os._exit(1)
+
+        def _arm_hard_exit(_signum, _frame):
+            # Runs in addition to the event loop's handler: CPython still
+            # writes to asyncio's wakeup fd for any signal with a Python
+            # handler, so the graceful path is unaffected.
+            if self._hard_exit_armed:
+                os._exit(1)
+            self._hard_exit_armed = True
+            signal.setitimer(signal.ITIMER_REAL, HARD_EXIT_TIMEOUT)
+
+        try:
+            signal.signal(signal.SIGALRM, _force_exit)
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, _arm_hard_exit)
+        except (ValueError, OSError) as e:
+            # Not the main thread; the loop handler is the only path available.
+            print(f"[shutdown] hard-exit backstop unavailable: {e}")
+
+    def _orphan_check(self) -> bool:
+        """
+        True if nothing is supervising this process any more.
+
+        Reparenting to init means the launching shell (or the batch
+        coordinator) is gone, so no one is reading this monitor's output.
+        """
+        try:
+            return os.getppid() <= 1
+        except OSError:
+            return False
+
+    async def _orphan_watchdog_loop(self, stop_event: asyncio.Event) -> None:
+        """
+        Detach if this process stays orphaned past the grace period.
+
+        Without this, a monitor whose terminal died keeps polling remote
+        endpoints indefinitely, competing for endpoint workers with live runs.
+        Deliberately unattended runs (``--unattended``) opt out.
+        """
+        if not self.orphan_detach:
+            return
+        while not stop_event.is_set():
+            try:
+                if self._orphan_check():
+                    if self._orphaned_since is None:
+                        self._orphaned_since = time.time()
+                        print(
+                            "[orphan] launching process is gone; will detach "
+                            f"in {ORPHAN_GRACE_SECONDS / 60:.0f} min unless "
+                            "reattached")
+                        self.write_status_snapshot()
+                    elif (time.time() - self._orphaned_since
+                            >= ORPHAN_GRACE_SECONDS):
+                        print(
+                            "[orphan] orphaned for "
+                            f"{ORPHAN_GRACE_SECONDS / 60:.0f} min; detaching "
+                            "now. Submitted jobs keep running and a later run "
+                            "will reattach to them.")
+                        self.detach()
+                        return
+                elif self._orphaned_since is not None:
+                    print("[orphan] supervision restored; staying attached")
+                    self._orphaned_since = None
+            except Exception as e:
+                print(f"[orphan] watchdog error: {e}")
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(), ORPHAN_CHECK_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+        return
+
     def _cancel_all_stages(self) -> None:
         """Synchronous remote/local cancellation for all stages."""
         for stage_workflow in self.stage_workflows:
-            stage_workflow.kill()
+            stage_workflow.kill(persist_stop=False)
 
     async def shutdown(self) -> None:
         """ Kill all stages and shut down the workflow engine. Idempotent. """
@@ -1640,6 +2340,12 @@ class SeekrPipeline:
         except Exception:
             local_state_dir = None
         now = time.time()
+        stages = {
+            sw.stage.name: sw.status_snapshot()
+            for sw in self.stage_workflows
+        }
+        co_schedule_fusion.apply_host_scheduler_status_to_fused_members(
+            stages, self.stage_workflows)
         return {
             "schema_version": STATUS_SCHEMA_VERSION,
             "timestamp": now,
@@ -1652,13 +2358,42 @@ class SeekrPipeline:
             "status_file": os.path.join(root, STATUS_FILE_NAME),
             "shutting_down": self._shutting_down,
             "detached_requested": self._detached_requested,
+            "orphaned_since": self._orphaned_since,
             "force_rerun_stages": sorted(self.force_rerun_stages),
             "benchmark_stage": self.benchmark_stage,
-            "stages": {
-                sw.stage.name: sw.status_snapshot()
-                for sw in self.stage_workflows
-            },
+            "stages": stages,
         }
+
+    def _foreign_status_writer_pid(self, target_path: str) -> int | None:
+        """
+        PID of another live process that last wrote the status file, if any.
+
+        The run lock normally makes this impossible; this is a second line of
+        defense so two writers cannot silently alternate snapshots (which the
+        monitor UI would render as statuses flapping every few seconds).
+        """
+        try:
+            with open(target_path, "r") as f:
+                existing = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(existing, dict):
+            return None
+        try:
+            other_pid = int(existing.get("pid", -1))
+        except (TypeError, ValueError):
+            return None
+        if other_pid <= 0 or other_pid == os.getpid():
+            return None
+        try:
+            os.kill(other_pid, 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass
+        except OSError:
+            return None
+        return other_pid
 
     def write_status_snapshot(self) -> None:
         """
@@ -1667,6 +2402,16 @@ class SeekrPipeline:
         """
         root = self.model.directory
         target_path = os.path.join(root, STATUS_FILE_NAME)
+        foreign_pid = self._foreign_status_writer_pid(target_path)
+        if foreign_pid is not None:
+            if not self._foreign_writer_warned:
+                self._foreign_writer_warned = True
+                print(
+                    f"[warning] status file {target_path} is owned by live PID "
+                    f"{foreign_pid}; not overwriting it. Two seekrflow "
+                    "processes appear to share this root directory."
+                )
+            return
         tmp_path = None
         try:
             snapshot = self.status_snapshot()
@@ -1752,6 +2497,7 @@ class SeekrPipeline:
 
             try:
                 sw.transfer_status = "running"
+                sw.transfer_direction = "back"
                 sw.transfer_error = None
                 transfer_base.transfer_files_to_from_remote_resource(
                     self.seekrflow.name,
@@ -1761,6 +2507,7 @@ class SeekrPipeline:
                 )
                 transferred_resources.add(resource_name)
                 sw.transfer_status = "completed"
+                sw.transfer_direction = None
                 print(
                     f"[keystroke] transferred from remote resource "
                     f"{resource_name} (stage={sw.stage.name})"
@@ -1930,7 +2677,7 @@ class SeekrPipeline:
                 print(f"[batch-cmd] error reading command file: {e}")
             try:
                 await asyncio.wait_for(
-                    stop_event.wait(), get_polling_interval())
+                    stop_event.wait(), BATCH_COMMAND_POLL_INTERVAL)
             except asyncio.TimeoutError:
                 pass
         return
@@ -2068,6 +2815,9 @@ class SeekrPipeline:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self._on_signal)
+        # Must come after add_signal_handler, which installs its own no-op
+        # handler for these signals.
+        self._install_hard_exit_backstop()
         try:
             await self._run_workflows_body()
         finally:
@@ -2100,7 +2850,9 @@ class SeekrPipeline:
         def stage_is_terminal(stage_workflow: StageWorkflow) -> bool:
             if stage_workflow.state == "completed":
                 return True
-            if stage_workflow.semaphore == "stop" and not stage_running(stage_workflow):
+            stopped = (stage_workflow.semaphore == "stop"
+                       or stage_workflow.stopped_for_shutdown)
+            if stopped and not stage_running(stage_workflow):
                 return True
             return False
 
@@ -2110,11 +2862,22 @@ class SeekrPipeline:
             return stage_workflow.stage.name == self.benchmark_stage
 
         for stage_workflow in self.stage_workflows:
-            stage_workflow.state = "unstarted"
+            # Do not wipe states restored from the status file. The batch UI
+            # reads that file every second; resetting to unstarted is what
+            # made queued SLURM jobs flicker as unstarted/failed.
+            if stage_workflow.state not in {
+                    "failed", "started", "queued", "completed"}:
+                stage_workflow.state = "unstarted"
             if not stage_allowed_to_run(stage_workflow):
                 stage_workflow.semaphore = "stop"
                 print(f"[benchmark] skipping non-benchmark stage: "
                       f"{stage_workflow.stage.name}")
+
+        # Re-apply wait/stop + sticky failed after the unstarted reset above.
+        self._restore_runtime_from_status_file()
+        for sw in self.stage_workflows:
+            if sw.stage.name in self.semaphore_overrides:
+                sw.semaphore = self.semaphore_overrides[sw.stage.name]
 
         print("[reattach] scanning for existing local processes from prior sessions...")
         for stage_workflow in self.stage_workflows:
@@ -2140,6 +2903,8 @@ class SeekrPipeline:
             self._live_display_loop(stop_event))
         batch_cmd_task = asyncio.create_task(
             self._batch_command_loop(stop_event))
+        orphan_task = asyncio.create_task(
+            self._orphan_watchdog_loop(stop_event))
         #monitor_task = asyncio.create_task(poll_job_status(self.telemetry, stop_event))
 
         try:
@@ -2152,6 +2917,15 @@ class SeekrPipeline:
                         all_terminal = True
                         break
                     if not stage_allowed_to_run(stage_workflow):
+                        continue
+
+                    # Free batch local slots once the stage is terminal.
+                    if (stage_workflow.holds_local_slot
+                            and stage_workflow.state in {
+                                "completed", "failed"}):
+                        stage_workflow.release_local_slot()
+
+                    if stage_workflow.stopped_for_shutdown:
                         continue
 
                     if stage_workflow.semaphore == "stop":
@@ -2172,7 +2946,20 @@ class SeekrPipeline:
                         continue
 
                     if stage_workflow.state == "completed":
-                        continue
+                        if fusion_host_needs_relaunch(
+                                stage_workflow, stage_by_name):
+                            if (stage_running(stage_workflow)
+                                    or stage_task_active(stage_workflow)):
+                                all_terminal = False
+                                continue
+                            # Host finished but a lumped member did not;
+                            # fall through to relaunch the combined job.
+                            stage_workflow.state = "unstarted"
+                        else:
+                            if (stage_running(stage_workflow)
+                                    or stage_task_active(stage_workflow)):
+                                all_terminal = False
+                            continue
 
                     if stage_running(stage_workflow):
                         all_terminal = False
@@ -2182,16 +2969,20 @@ class SeekrPipeline:
                         all_terminal = False
                         continue
 
-                    if stage_workflow.state in {"failed", "unstarted", "unknown"}:
+                    if stage_workflow.state in {
+                            "failed", "unstarted", "unknown", "queued",
+                            "started"}:
                         # (Re)launch stage when permitted by semaphore and deps.
                         prior_state = stage_workflow.state
                         stage_workflow.dependency_indices = []
                         stage_workflow.dependency_tasks = []
                         stage_workflow.task = None
                         stage_workflow.process = None
-                        stage_workflow.state = "unstarted"
-                        stage_workflow.progress = 0.0
-                        stage_workflow.manager_status = "idle"
+                        if prior_state not in {"queued", "failed"}:
+                            stage_workflow.state = "unstarted"
+                        if prior_state != "failed":
+                            stage_workflow.manager_status = "idle"
+                            stage_workflow.last_error = None
                         # Wire cross-resource transfer intent from the upstream
                         # stage (input_stage_index is 1-indexed; 0 means none).
                         upstream_idx = getattr(
@@ -2208,7 +2999,13 @@ class SeekrPipeline:
                                     != stage_workflow.resource_name):
                                 stage_workflow.transfer_from = \
                                     upstream_sw.resource_name
-                        if (prior_state in {"unstarted", "unknown"}
+                        if ((prior_state in {
+                                    "unstarted", "unknown", "started",
+                                    "queued"}
+                                or should_reattach_queued_jobs(
+                                    stage_workflow)
+                                or bool(stage_workflow.job_ids)
+                                or stage_workflow.progress > 0)
                                 and stage_workflow.resource_name != "local"
                                 and stage_workflow.fusion_host is None):
                             force_for_probe = stage_workflow.force_overwrite
@@ -2223,8 +3020,28 @@ class SeekrPipeline:
                                         break
                             if not force_overwrite_skips_launch_probe(
                                     force_for_probe):
+                                resume_probe = (
+                                    prior_state in {
+                                        "started", "queued", "completed"}
+                                    or bool(stage_workflow.job_ids)
+                                    or stage_workflow.progress > 0)
+                                if (not resume_probe
+                                        and is_fusion_host(stage_workflow)):
+                                    for _fname in co_schedule_fusion.fused_set_members(
+                                            stage_workflow):
+                                        _msw = stage_by_name.get(_fname)
+                                        if _msw is None:
+                                            continue
+                                        if (_msw.job_ids
+                                                or _msw.progress > 0
+                                                or _msw.state in {
+                                                    "started", "queued",
+                                                    "completed"}):
+                                            resume_probe = True
+                                            break
                                 probe_action, probe_status = (
-                                    await stage_workflow.probe_remote_launch())
+                                    await stage_workflow.probe_remote_launch(
+                                        resume=resume_probe))
                                 if probe_action == "completed":
                                     if is_fusion_host(stage_workflow):
                                         mark_fused_set_completed(
@@ -2233,15 +3050,48 @@ class SeekrPipeline:
                                         stage_workflow.state = "completed"
                                         stage_workflow.progress = 1.0
                                     continue
+                                if probe_action == "defer":
+                                    print(
+                                        f"[remote-probe] stage "
+                                        f"{stage_workflow.stage.name}: "
+                                        f"squeue reading inconclusive; "
+                                        f"not submitting this round"
+                                    )
+                                    if prior_state in {"started", "queued"}:
+                                        stage_workflow.state = prior_state
+                                    else:
+                                        stage_workflow.state = "queued"
+                                    all_terminal = False
+                                    continue
                                 if probe_action == "reattach":
                                     manager_status = (
                                         (probe_status or {})
                                         .get("manager_status") or {})
+                                    jobs = manager_status.get("jobs") or []
                                     stage_workflow.state = "started"
                                     stage_workflow.manager_status = (
                                         determine_stage_manager_status(
                                             manager_status))
-                                    for job in manager_status.get("jobs", []):
+                                    if remote_model_missing(probe_status):
+                                        print(
+                                            f"[remote-launch] stage "
+                                            f"{stage_workflow.stage.name}: "
+                                            f"jobs are live but remote model "
+                                            f"is missing; transferring "
+                                            f"before monitor-only reattach"
+                                        )
+                                        try:
+                                            stage_workflow.push_files_outbound()
+                                        except Exception:
+                                            all_terminal = False
+                                            continue
+                                    if probe_status is not None and (
+                                            jobs
+                                            or not remote_model_missing(
+                                                probe_status)):
+                                        stage_workflow.status_polled_at = (
+                                            time.time())
+                                    for job in jobs:
                                         job_id = job.get("JobID")
                                         if job_id:
                                             stage_workflow.job_ids.add(
@@ -2254,6 +3104,60 @@ class SeekrPipeline:
                                             stage_workflow.task)
                                     all_terminal = False
                                     continue
+                                if remote_model_missing(probe_status):
+                                    print(
+                                        f"[remote-launch] stage "
+                                        f"{stage_workflow.stage.name}: "
+                                        f"remote model missing with idle "
+                                        f"scheduler; clearing stale job ids "
+                                        f"and submitting after transfer"
+                                    )
+                                    stage_workflow.job_ids.clear()
+                                elif stage_workflow.job_ids:
+                                    print(
+                                        f"[remote-launch] stage "
+                                        f"{stage_workflow.stage.name}: "
+                                        f"squeue empty; clearing stale job "
+                                        f"ids {sorted(stage_workflow.job_ids)} "
+                                        f"before submit"
+                                    )
+                                    stage_workflow.job_ids.clear()
+                        # Batch local-stage slot gate (no-op without slot file).
+                        if (stage_workflow.resource_name == "local"
+                                and self.local_slot_file is not None
+                                and not stage_workflow.holds_local_slot):
+                            import seekrflow.modules.batch.local_slots as \
+                                local_slots
+                            work_dir = (
+                                self.seekrflow.work_directory
+                                or self.model.directory)
+                            existing_local = (
+                                workload_local_mp
+                                .check_for_existing_local_processes(
+                                    self.model.directory,
+                                    stage_workflow.stage.name))
+                            acquired = local_slots.try_acquire(
+                                self.local_slot_file,
+                                str(work_dir),
+                                stage_workflow.stage.name,
+                                os.getpid(),
+                            )
+                            if acquired:
+                                stage_workflow.holds_local_slot = True
+                                stage_workflow.local_slot_file = (
+                                    self.local_slot_file)
+                                stage_workflow.state = "unstarted"
+                            elif existing_local is not None:
+                                print(
+                                    f"[local-slot] stage "
+                                    f"{stage_workflow.stage.name}: reattaching "
+                                    f"without a free slot "
+                                    f"(PID {existing_local.pid})")
+                                stage_workflow.state = "unstarted"
+                            else:
+                                stage_workflow.state = "queued"
+                                all_terminal = False
+                                continue
                         await stage_workflow.create_tasks()
                         if stage_workflow.task is not None:
                             launched_tasks.append(stage_workflow.task)
@@ -2266,7 +3170,7 @@ class SeekrPipeline:
 
                 if all_terminal:
                     break
-                await asyncio.sleep(get_polling_interval())
+                await _sleep_polling_interval()
         finally:
             # Stop the background monitor, keystroke watcher, and live display
             stop_event.set()
@@ -2274,6 +3178,7 @@ class SeekrPipeline:
             await keystroke_task
             await live_display_task
             await batch_cmd_task
+            await orphan_task
 
         if (not self._detached_requested) and len(launched_tasks) > 0:
             await asyncio.gather(*launched_tasks, return_exceptions=True)
@@ -2302,6 +3207,8 @@ async def launch_seekr_pipeline(
         keystrokes_enabled: bool = True,
         batch_child_mode: bool = False,
         polling_interval: float | None = None,
+        local_slot_file: str | None = None,
+        orphan_detach: bool = True,
         ) -> None:
     backend = await LocalExecutionBackend(ThreadPoolExecutor())
     workflow_engine = await WorkflowEngine.create(backend=backend)
@@ -2315,7 +3222,9 @@ async def launch_seekr_pipeline(
         semaphore_overrides=semaphore_overrides or {},
         benchmark_stage=benchmark_stage,
         keystrokes_enabled=keystrokes_enabled,
-        batch_child_mode=batch_child_mode)
+        batch_child_mode=batch_child_mode,
+        local_slot_file=local_slot_file,
+        orphan_detach=orphan_detach)
     await pipeline.run_workflows()
     return
 
@@ -2330,6 +3239,8 @@ def run_model(
         keystrokes_enabled: bool = True,
         batch_child_mode: bool = False,
         polling_interval: float | None = None,
+        local_slot_file: str | None = None,
+        orphan_detach: bool = True,
         ) -> None:
     """
     Run the SEEKR calculation using remote, cloud, or local resources.
@@ -2520,7 +3431,9 @@ def run_model(
         benchmark_stage,
         keystrokes_enabled=keystrokes_enabled,
         batch_child_mode=batch_child_mode,
-        polling_interval=polling_interval))
+        polling_interval=polling_interval,
+        local_slot_file=local_slot_file,
+        orphan_detach=orphan_detach))
 
     if perform_final_transfer:
         detached_requested = False
@@ -2546,13 +3459,28 @@ def run_model(
         else:
             for resource in completed_stage_resources.values():
                 try:
+                    patch_completed_remote_transfer(
+                        root_directory,
+                        transfer_status="running",
+                        transfer_direction="back",
+                    )
                     transfer_base.transfer_files_to_from_remote_resource(
                         seekrflow.name,
                         resource,
                         root_directory,
                         backwards=True,
                     )
+                    patch_completed_remote_transfer(
+                        root_directory,
+                        transfer_status="completed",
+                        transfer_direction=None,
+                    )
                 except Exception as e:
+                    patch_completed_remote_transfer(
+                        root_directory,
+                        transfer_status="failed",
+                        transfer_direction="back",
+                    )
                     print(
                         f"[warning] final backward transfer failed for "
                         f"resource {resource.name}: {e}")

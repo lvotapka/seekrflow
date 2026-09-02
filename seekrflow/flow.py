@@ -6,12 +6,61 @@ and running.
 """
 
 import os
+import sys
 import argparse
 
 import seekrflow.modules.structures as structures
 import seekrflow.modules.seekr_input as seekr_input
 import seekrflow.modules.seekr_run as seekr_run
+import seekrflow.modules.run_lock as run_lock
+import seekrflow.modules.process_registry as process_registry
 import seekrflow.parameterize as parameterize_module
+
+
+# Instructions that mutate the model root and so must run one-at-a-time.
+EXCLUSIVE_INSTRUCTIONS = frozenset({"any", "prepare", "run"})
+
+
+def resolve_root_directory(seekrflow: structures.Seekrflow) -> str | None:
+    """
+    Best-effort resolution of the model root directory for locking purposes.
+    """
+    try:
+        if seekrflow.work_directory is None:
+            # Hotshot mode: root_directory is an absolute path to the model dir.
+            if seekrflow.root_directory:
+                return os.path.abspath(str(seekrflow.root_directory))
+            return None
+        return str(seekrflow.get_root_directory())
+    except (AssertionError, OSError, TypeError):
+        return None
+
+
+def acquire_run_lock(
+        seekrflow: structures.Seekrflow,
+        instruction: str,
+        ) -> run_lock.RunLock | None:
+    """
+    Take the singleton lock for this calculation, or exit if another live
+    seekrflow process already owns it.
+    """
+    root_directory = resolve_root_directory(seekrflow)
+    if root_directory is None:
+        return None
+    try:
+        return run_lock.acquire(root_directory, instruction)
+    except run_lock.RunLockBusyError as e:
+        owner = e.owner
+        print(
+            f"ERROR: {instruction} refused: {e}.\n"
+            f"       root directory: {root_directory}\n"
+            f"       owner argv: {' '.join(owner.get('argv') or []) or '(unknown)'}\n"
+            "       Stop that process first, or use a different work "
+            "directory. Two seekrflow processes on one root directory "
+            "corrupt each other's status and submit duplicate jobs.",
+            file=sys.stderr,
+        )
+        raise SystemExit(run_lock.DUPLICATE_RUN_EXIT_CODE) from e
 
 
 def flow(
@@ -27,6 +76,8 @@ def flow(
         skip_checks: bool = False,
         batch_child_mode: bool = False,
         polling_interval: float | None = None,
+        local_slot_file: str | None = None,
+        unattended: bool = False,
         ) -> None:
     """
     Execute the instructed seekrflow stage.
@@ -48,27 +99,48 @@ def flow(
     elif instruction == "run":
         doing_run = True
 
-    if doing_parameterize:
-        print("Parameterizing system...")
-        parameterize_module.parameterize(seekrflow)
+    lock = None
+    registered = False
+    if instruction in EXCLUSIVE_INSTRUCTIONS:
+        lock = acquire_run_lock(seekrflow, instruction)
+        root_directory = resolve_root_directory(seekrflow)
+        if root_directory is not None:
+            process_registry.register(
+                root_directory, instruction,
+                work_directory=seekrflow.work_directory,
+                name=seekrflow.name)
+            registered = True
 
-    if doing_prepare:
-        print("Preparing system...")
-        prepare_force_overwrite = force_rerun is not None \
-            and (not force_rerun or "prepare" in force_rerun)
-        seekr_input.prepare_model(
-            seekrflow, force_overwrite=prepare_force_overwrite,
-            skip_checks=skip_checks)
-    if doing_run:
-        print("Running system...")
-        seekr_run.run_model(
-            seekrflow, transfer_before, transfer_from_remote_only, force_rerun,
-            benchmark_stage=benchmark_stage,
-            placement_resource_overrides=resource_dict,
-            semaphore_dict=semaphore_dict,
-            keystrokes_enabled=keystrokes_enabled,
-            batch_child_mode=batch_child_mode,
-            polling_interval=polling_interval)
+    try:
+        if doing_parameterize:
+            print("Parameterizing system...")
+            parameterize_module.parameterize(seekrflow)
+
+        if doing_prepare:
+            print("Preparing system...")
+            prepare_force_overwrite = force_rerun is not None \
+                and (not force_rerun or "prepare" in force_rerun)
+            seekr_input.prepare_model(
+                seekrflow, force_overwrite=prepare_force_overwrite,
+                skip_checks=skip_checks)
+        if doing_run:
+            print("Running system...")
+            seekr_run.run_model(
+                seekrflow, transfer_before, transfer_from_remote_only,
+                force_rerun,
+                benchmark_stage=benchmark_stage,
+                placement_resource_overrides=resource_dict,
+                semaphore_dict=semaphore_dict,
+                keystrokes_enabled=keystrokes_enabled,
+                batch_child_mode=batch_child_mode,
+                polling_interval=polling_interval,
+                local_slot_file=local_slot_file,
+                orphan_detach=not unattended)
+    finally:
+        if registered:
+            process_registry.unregister()
+        if lock is not None:
+            lock.release()
 
 
 def main():
@@ -151,6 +223,18 @@ def main():
         help="Override the monitor polling interval in seconds. Used by "
         "batch.py to slow background systems.")
     argparser.add_argument(
+        "--local-slot-file", dest="local_slot_file",
+        metavar="PATH", type=str, default=None,
+        help="Batch local-stage slot pool file. When set, local stages "
+        "acquire a slot before submit. Standalone runs omit this.")
+    argparser.add_argument(
+        "--unattended", dest="unattended", action="store_true",
+        default=False,
+        help="Keep monitoring even after the launching shell exits (e.g. for "
+        "nohup runs). By default, a run whose launching process has gone away "
+        "detaches itself after 30 minutes so it stops polling remote "
+        "endpoints unsupervised; submitted jobs keep running either way.")
+    argparser.add_argument(
         "--semaphore", dest="semaphore",
         metavar="STAGE_CONTROL", type=str, default=None,
         help="Control stage execution. Format: 'stage:value,stage:value,...' "
@@ -191,7 +275,9 @@ def main():
     if batch_child_mode:
         keystrokes_enabled = False
     polling_interval = args["poll_interval"]
+    local_slot_file = args["local_slot_file"]
     skip_checks = args["skip_checks"]
+    unattended = bool(args["unattended"])
 
     semaphore_dict = {}
     if args["semaphore"]:
@@ -283,6 +369,8 @@ def main():
          skip_checks=skip_checks,
          batch_child_mode=batch_child_mode,
          polling_interval=polling_interval,
+         local_slot_file=local_slot_file,
+         unattended=unattended,
          )
 
 

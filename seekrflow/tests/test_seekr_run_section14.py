@@ -54,9 +54,79 @@ class TestClassifyRemoteProbeStatus:
         assert remote_stage_lifecycle.classify_remote_probe_status(
             status) == "submit"
 
+    def test_submit_when_model_missing_first_launch(self):
+        status = {
+            "success": False,
+            "error": "Model file not found: /remote/model.json",
+            "stage_status": {
+                "state": "unstarted",
+                "notes": "Model file not found: /remote/model.json",
+                "model_xml_found": False,
+            },
+            "manager_status": {"jobs": []},
+        }
+        assert remote_stage_lifecycle.classify_remote_probe_status(
+            status) == "submit"
+
     def test_submit_on_none(self):
         assert remote_stage_lifecycle.classify_remote_probe_status(
-            None) == "submit"
+            None) == "defer"
+
+    def test_submit_when_tracked_job_ids_and_empty_queue(self):
+        status = {
+            "stage_status": {"state": "unstarted", "progress": 0.0},
+            "manager_status": {"jobs": []},
+        }
+        assert remote_stage_lifecycle.classify_remote_probe_status(
+            status, tracked_job_ids={"123"}) == "submit"
+
+    def test_reattach_on_none_when_tracked_job_ids(self):
+        assert remote_stage_lifecycle.classify_remote_probe_status(
+            None, tracked_job_ids={"123"}) == "reattach"
+
+    def test_submit_when_model_missing_with_tracked_ids_and_idle_queue(self):
+        status = {
+            "success": False,
+            "error": "Model file not found: /remote/model.json",
+            "stage_status": {
+                "state": "unstarted",
+                "notes": "Model file not found: /remote/model.json",
+                "model_xml_found": False,
+            },
+            "manager_status": {"jobs": []},
+        }
+        assert remote_stage_lifecycle.classify_remote_probe_status(
+            status, tracked_job_ids={"123"}) == "submit"
+        assert remote_stage_lifecycle.remote_model_missing(status)
+
+    def test_defer_when_squeue_error_without_jobs(self):
+        status = {
+            "stage_status": {"state": "unstarted"},
+            "manager_status": {
+                "jobs": [],
+                "error": "No SLURM state file found",
+            },
+        }
+        assert remote_stage_lifecycle.classify_remote_probe_status(
+            status) == "defer"
+        assert remote_stage_lifecycle.classify_remote_probe_status(
+            status, tracked_job_ids={"9"}, resume=True) == "reattach"
+
+    def test_reattach_when_model_missing_but_jobs_live(self):
+        status = {
+            "success": False,
+            "error": "Model file not found: /remote/model.json",
+            "stage_status": {
+                "state": "unstarted",
+                "notes": "Model file not found: /remote/model.json",
+                "model_xml_found": False,
+            },
+            "manager_status": {
+                "jobs": [{"JobID": "42", "State": "RUNNING"}],
+            },
+        }
+        assert remote_stage_lifecycle.classify_remote_probe_status(
+            status, tracked_job_ids={"42"}) == "reattach"
 
 
 class TestForceOverwriteSkipsLaunchProbe:
@@ -183,9 +253,11 @@ class TestSubmitRemoteCancelWorkflow:
     def test_cancel_by_name_passes_empty_id_slot(self, monkeypatch):
         captured: dict = {}
 
-        def fake_submit(seekrflow, resource_name, workflow, extra_args=None, silent=False):
+        def fake_submit(seekrflow, resource_name, workflow, extra_args=None,
+                        silent=False, kind="submit"):
             captured["extra_args"] = extra_args
             captured["workflow"] = workflow
+            captured["kind"] = kind
 
         monkeypatch.setattr(
             workload_remote, "submit_remote_workflow", fake_submit)
@@ -205,6 +277,7 @@ class TestSubmitRemoteCancelWorkflow:
             seekrflow, "cluster", job_name="run1_bd")
         assert captured["extra_args"] == ["", "run1_bd"]
         assert captured["workflow"] is workload_slurm.slurm_remote_cancel_workflow
+        assert captured["kind"] == "cancel"
 
 
 class TestStageWorkflowKill:
@@ -394,5 +467,41 @@ def test_probe_remote_launch_failure_falls_through(monkeypatch):
         resource=structures.Resource_remote_slurm(name="cluster"),
     )
     action, status = asyncio.run(sw.probe_remote_launch())
-    assert action == "submit"
+    assert action == "defer"
     assert status is None
+
+
+def test_restore_skips_polled_scheduler_labels(tmp_path):
+    _ensure_radical_mock()
+    import json
+    from seekrflow.modules import seekr_run
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / ".seekrflow_job_status.json").write_text(json.dumps({
+        "stages": {
+            "bd": {
+                "state": "started",
+                "semaphore": "go",
+                "manager_status": "running",
+                "job_ids": ["99"],
+                "status_polled_at": 123456.0,
+            }
+        }
+    }))
+    sw = seekr_run.StageWorkflow(
+        model=SimpleNamespace(directory=str(root)),
+        seekrflow=SimpleNamespace(name="run1"),
+        stage=SimpleNamespace(name="bd", index=1),
+        workflow_engine=object(),
+        resource_name="cluster",
+        resource=structures.Resource_remote_slurm(name="cluster"),
+    )
+    pipeline = seekr_run.SeekrPipeline.__new__(seekr_run.SeekrPipeline)
+    pipeline.model = SimpleNamespace(directory=str(root))
+    pipeline.stage_workflows = [sw]
+    pipeline._restore_runtime_from_status_file()
+    assert sw.state == "started"
+    assert sw.manager_status == "idle"
+    assert sw.status_polled_at is None
+    assert "99" in sw.job_ids

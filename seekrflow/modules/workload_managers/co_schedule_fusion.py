@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import typing
 
+from seekrflow.modules.workload_managers import remote_stage_lifecycle
+
 if typing.TYPE_CHECKING:
     from seekrflow.modules.structures import Resource_remote_base
 
@@ -166,6 +168,63 @@ def fusion_host_name(stage_workflow) -> str | None:
     return None
 
 
+POLLED_SCHEDULER_STATUSES = frozenset({
+    "queued", "running", "running/queued",
+})
+
+
+def copy_host_scheduler_onto_member(member_sw, host_sw) -> None:
+    """
+    Fused members have no SLURM/PBS state file of their own. Copy the host
+    job's queued/running label so monitors and the batch table describe the
+    job that is actually on the scheduler.
+    """
+    if host_sw is None:
+        return
+    host_mgr = getattr(host_sw, "manager_status", None)
+    if host_mgr not in POLLED_SCHEDULER_STATUSES:
+        return
+    member_jobs = getattr(member_sw, "job_ids", None) or set()
+    member_mgr = getattr(member_sw, "manager_status", None)
+    if member_jobs or member_mgr in POLLED_SCHEDULER_STATUSES:
+        return
+    member_sw.manager_status = host_mgr
+    if getattr(member_sw, "status_polled_at", None) is None:
+        host_polled = getattr(host_sw, "status_polled_at", None)
+        if host_polled is not None:
+            member_sw.status_polled_at = host_polled
+
+
+def apply_host_scheduler_status_to_fused_members(
+        stages: dict,
+        stage_workflows: list,
+        ) -> None:
+    """
+    Mutate pipeline snapshot dicts so fused members show the host squeue
+    label when they have no jobs of their own.
+    """
+    for sw in stage_workflows:
+        if not is_fusion_member(sw):
+            continue
+        host_name = sw.fusion_host
+        host_info = stages.get(host_name) if host_name else None
+        member_info = stages.get(sw.stage.name)
+        if not isinstance(host_info, dict) or not isinstance(member_info, dict):
+            continue
+        host_mgr = str(host_info.get("manager_status") or "")
+        if host_mgr not in POLLED_SCHEDULER_STATUSES:
+            continue
+        member_jobs = member_info.get("job_ids") or []
+        member_mgr = str(member_info.get("manager_status") or "")
+        if member_jobs or member_mgr in POLLED_SCHEDULER_STATUSES:
+            continue
+        member_info["manager_status"] = host_mgr
+        if not member_info.get("status_polled_at"):
+            host_polled = host_info.get("status_polled_at")
+            if host_polled:
+                member_info["status_polled_at"] = host_polled
+
+
 def fused_set_members(
         host_stage_workflow: typing.Any,
         ) -> list[str]:
@@ -214,6 +273,29 @@ def fused_set_progress(
     return total_progress / normalize
 
 
+def fused_set_completion_fraction(
+        host_stage_workflow_name: str,
+        stage_by_name: dict,
+        ) -> float:
+    """
+    Fraction of fused-set members in state ``completed``.
+
+    Includes logistic / ``co_schedule_with`` members, unlike
+    ``fused_set_progress``. Idle-incomplete resubmit uses this so a finished
+    host with an unfinished lumped tail still counts as incomplete work.
+    """
+    host_stage_workflow = stage_by_name[host_stage_workflow_name]
+    members = fused_set_members(host_stage_workflow)
+    if not members:
+        return 0.0
+    done = 0
+    for stage_name in members:
+        sw = stage_by_name.get(stage_name)
+        if sw is not None and sw.state == "completed":
+            done += 1
+    return done / float(len(members))
+
+
 def mark_fused_set_completed(
         host_stage_workflow: typing.Any,
         stage_by_name: dict,
@@ -228,24 +310,41 @@ def mark_fused_set_completed(
 def classify_fused_probe_status(
         member_statuses: dict[str, dict | None],
         host_stage_name: str,
+        tracked_job_ids: set[str] | frozenset[str] | None = None,
+        resume: bool = False,
         ) -> str:
     """
     Classify a one-shot probe over all fused-set members.
 
-    Returns ``completed``, ``reattach``, or ``submit``.
+    Returns ``completed``, ``reattach``, ``submit``, or ``defer``.
+
+    Live jobs on any member reattach. Fused members often have no SLURM
+    state file, so only the **host** queue reading can be uncertain.
+    A failed or erroring host probe never submits (reattach if leftover
+    ids / resume, else defer). A clean empty host squeue may submit so
+    cancelled jobs can be replaced.
     """
+    conservative = bool(tracked_job_ids) or resume
+    any_jobs = False
+    all_completed = True
     for status in member_statuses.values():
+        jobs = remote_stage_lifecycle.jobs_from_status(status)
+        if jobs:
+            any_jobs = True
         if status is None:
-            return "submit"
+            all_completed = False
+            continue
         stage_status = status.get("stage_status") or {}
         if stage_status.get("state") != "completed":
-            break
-    else:
-        return "completed"
-
+            all_completed = False
+    if any_jobs:
+        return "reattach"
     host_status = member_statuses.get(host_stage_name)
-    if host_status is not None:
-        jobs = (host_status.get("manager_status") or {}).get("jobs") or []
-        if jobs:
+    if (host_status is None
+            or remote_stage_lifecycle.scheduler_queue_uncertain(host_status)):
+        if conservative:
             return "reattach"
+        return "defer"
+    if all_completed and member_statuses:
+        return "completed"
     return "submit"

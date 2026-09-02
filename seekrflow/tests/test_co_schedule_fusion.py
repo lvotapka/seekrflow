@@ -59,6 +59,8 @@ class _MockStageWorkflow:
         self.peer_workflows: dict = {}
         self.state = "unstarted"
         self.manager_status = "idle"
+        self.job_ids: set[str] = set()
+        self.status_polled_at = None
 
 
 class TestCombineFusedCommands:
@@ -226,6 +228,20 @@ class TestFusedSetHelpers:
         by_name = self._by_name(host, logistic)
         assert co_schedule_fusion.fused_set_progress("host", by_name) == 1.0
 
+    def test_fused_set_completion_fraction_includes_logistic(self):
+        host = _MockStageWorkflow(_MockStage("host", index=1))
+        host.state = "completed"
+        logistic = _MockStageWorkflow(_MockStage("logistic", index=2))
+        logistic.co_schedule_with = "predecessor"
+        logistic.state = "started"
+        host.fused_after = ["logistic"]
+        by_name = self._by_name(host, logistic)
+        assert co_schedule_fusion.fused_set_completion_fraction(
+            "host", by_name) == 0.5
+        logistic.state = "completed"
+        assert co_schedule_fusion.fused_set_completion_fraction(
+            "host", by_name) == 1.0
+
     def test_classify_fused_probe_all_complete(self):
         statuses = {
             "host": {
@@ -267,6 +283,50 @@ class TestFusedSetHelpers:
         }
         assert co_schedule_fusion.classify_fused_probe_status(
             statuses, "host") == "submit"
+
+    def test_classify_fused_probe_none_defers(self):
+        statuses = {
+            "host": None,
+            "fused": {
+                "stage_status": {"state": "started"},
+                "manager_status": {"jobs": []},
+            },
+        }
+        assert co_schedule_fusion.classify_fused_probe_status(
+            statuses, "host") == "defer"
+        assert co_schedule_fusion.classify_fused_probe_status(
+            statuses, "host", tracked_job_ids={"1"}) == "reattach"
+
+    def test_classify_fused_probe_resume_with_idle_queue_submits(self):
+        statuses = {
+            "host": {
+                "stage_status": {"state": "completed"},
+                "manager_status": {"jobs": []},
+            },
+            "fused": {
+                "stage_status": {"state": "started"},
+                "manager_status": {"jobs": []},
+            },
+        }
+        assert co_schedule_fusion.classify_fused_probe_status(
+            statuses, "host", resume=True) == "submit"
+
+    def test_classify_fused_member_state_file_missing_does_not_block(self):
+        statuses = {
+            "host": {
+                "stage_status": {"state": "started"},
+                "manager_status": {"jobs": []},
+            },
+            "fused": {
+                "stage_status": {"state": "unstarted"},
+                "manager_status": {
+                    "jobs": [],
+                    "error": "No SLURM state file found for stage 'fused'",
+                },
+            },
+        }
+        assert co_schedule_fusion.classify_fused_probe_status(
+            statuses, "host", resume=True, tracked_job_ids={"9"}) == "submit"
 
 
 class TestFusionDependenciesSatisfied:
@@ -349,3 +409,66 @@ class TestValidateRunSettingsFusionGuards:
             })(),
         ]})()
         structures.validate_run_settings(seekrflow, model)
+
+
+class TestHostSchedulerCopiedOntoFusedMembers:
+    def test_copy_host_scheduler_onto_member(self):
+        host = _MockStageWorkflow(_MockStage("host", index=1))
+        member = _MockStageWorkflow(_MockStage("ramd", index=2))
+        host.manager_status = "running"
+        host.status_polled_at = 99.0
+        member.fusion_host = "host"
+        co_schedule_fusion.copy_host_scheduler_onto_member(member, host)
+        assert member.manager_status == "running"
+        assert member.status_polled_at == 99.0
+
+        member.manager_status = "idle"
+        member.status_polled_at = 50.0
+        co_schedule_fusion.copy_host_scheduler_onto_member(member, host)
+        assert member.manager_status == "running"
+        assert member.status_polled_at == 50.0
+
+    def test_copy_skips_when_host_idle(self):
+        host = _MockStageWorkflow(_MockStage("host", index=1))
+        member = _MockStageWorkflow(_MockStage("ramd", index=2))
+        host.manager_status = "idle"
+        co_schedule_fusion.copy_host_scheduler_onto_member(member, host)
+        assert member.manager_status == "idle"
+
+    def test_snapshot_overlay_copies_host_label(self):
+        host = _MockStageWorkflow(_MockStage("host", index=1))
+        member = _MockStageWorkflow(_MockStage("ramd", index=2))
+        member.fusion_host = "host"
+        stages = {
+            "host": {
+                "manager_status": "queued",
+                "status_polled_at": 1.0,
+                "job_ids": ["9"],
+            },
+            "ramd": {
+                "manager_status": "idle",
+                "status_polled_at": None,
+                "job_ids": [],
+            },
+        }
+        co_schedule_fusion.apply_host_scheduler_status_to_fused_members(
+            stages, [host, member])
+        assert stages["ramd"]["manager_status"] == "queued"
+        assert stages["ramd"]["status_polled_at"] == 1.0
+
+    def test_snapshot_overlay_keeps_member_jobs(self):
+        host = _MockStageWorkflow(_MockStage("host", index=1))
+        member = _MockStageWorkflow(_MockStage("ramd", index=2))
+        member.fusion_host = "host"
+        stages = {
+            "host": {"manager_status": "queued", "status_polled_at": 1.0},
+            "ramd": {
+                "manager_status": "running",
+                "status_polled_at": 2.0,
+                "job_ids": ["8"],
+            },
+        }
+        co_schedule_fusion.apply_host_scheduler_status_to_fused_members(
+            stages, [host, member])
+        assert stages["ramd"]["manager_status"] == "running"
+        assert stages["ramd"]["status_polled_at"] == 2.0

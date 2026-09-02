@@ -276,7 +276,12 @@ def pbs_remote_status_workflow(args):
     last_known_elapsed = None
 
     state_path = find_latest_state_file(work_dir, stage_name)
-    if state_path is not None and state_path.exists():
+    if state_path is None:
+        manager_status["error"] = (
+            f"No PBS state file found for stage {stage_name!r} under "
+            f"{get_state_dir(work_dir)}"
+        )
+    elif state_path is not None and state_path.exists():
         try:
             st = RunState.load(state_path)
             try:
@@ -354,9 +359,11 @@ def pbs_remote_status_workflow(args):
                 "model_xml_found": False,
             }
         )
+        # Unclean: callers must not treat this as an authoritative stage
+        # state (model may still be transferring while jobs are queued).
         return {
-            "success": True,
-            "error": None,
+            "success": False,
+            "error": stage_status["notes"],
             "manager_status": manager_status,
             "stage_status": stage_status,
             "last_known_elapsed": last_known_elapsed,

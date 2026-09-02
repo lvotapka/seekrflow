@@ -332,3 +332,202 @@ class TestRemoteIdleIncompletePolicy:
         ]
         asyncio.run(_run_monitor_with_statuses(host, monkeypatch, statuses))
         assert host.state == "unstarted"
+
+    def test_fused_host_resubmits_when_logistic_member_incomplete(
+            self, monkeypatch, seekr_run_module):
+        """Lumped logistic tails are invisible to fused_set_progress."""
+        host = _make_remote_stage_workflow(
+            seekr_run_module, name="host", fused_after=["member"],
+            last_progress=1.0)
+        member = _make_remote_stage_workflow(
+            seekr_run_module, fusion_host="host", name="member")
+        member.co_schedule_with = "predecessor"
+        member.stage.scale_type = "logistic"
+        by_name = {"host": host, "member": member}
+        host.peer_workflows = by_name
+        member.peer_workflows = by_name
+        host.state = "completed"
+        host.progress = 1.0
+        member.state = "started"
+        member.progress = 0.0
+        assert seekr_run_module.co_schedule_fusion.fused_set_progress(
+            "host", by_name) == 1.0
+        statuses = [
+            _idle_incomplete_status(progress=1.0, state="completed",
+                                    finished=True),
+            _idle_incomplete_status(progress=1.0, state="completed",
+                                    finished=True),
+            _idle_incomplete_status(progress=1.0, state="completed",
+                                    finished=True),
+        ]
+        asyncio.run(_run_monitor_with_statuses(host, monkeypatch, statuses))
+        assert host.state == "unstarted"
+
+    def test_fusion_host_needs_relaunch_when_member_incomplete(
+            self, seekr_run_module):
+        host = _make_remote_stage_workflow(
+            seekr_run_module, name="host", fused_after=["member"])
+        member = _make_remote_stage_workflow(
+            seekr_run_module, fusion_host="host", name="member")
+        host.state = "completed"
+        member.state = "started"
+        by_name = {"host": host, "member": member}
+        assert seekr_run_module.fusion_host_needs_relaunch(host, by_name)
+        member.state = "completed"
+        assert not seekr_run_module.fusion_host_needs_relaunch(host, by_name)
+        assert not seekr_run_module.fusion_host_needs_relaunch(
+            member, by_name)
+
+
+    def test_status_contention_uses_short_retry(
+            self, monkeypatch, seekr_run_module):
+        from seekrflow.modules.workload_managers import remote as workload_remote
+
+        sw = _make_remote_stage_workflow(seekr_run_module)
+        sleeps = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+            sw.detached_requested = True
+
+        def boom(*args, **kwargs):
+            raise seekr_run_module.globus_compute_sdk.GlobusRetryableError(
+                "globus-client: status poll cap reached (2 in-flight "
+                "status tasks)")
+
+        monkeypatch.setattr(seekr_run_module.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(workload_remote, "status_remote", boom)
+        asyncio.run(sw._monitor_stage_loop())
+        assert sleeps == [seekr_run_module.STATUS_CONTENTION_RETRY_S]
+
+    def test_sticky_job_ids_clear_and_fused_host_resubmits(
+            self, monkeypatch, seekr_run_module):
+        """Leftover sbatch ids must not block idle-incomplete forever."""
+        host = _make_remote_stage_workflow(
+            seekr_run_module, name="host", fused_after=["member"])
+        member = _make_remote_stage_workflow(
+            seekr_run_module, fusion_host="host", name="member")
+        member.co_schedule_with = "predecessor"
+        member.stage.scale_type = "logistic"
+        by_name = {"host": host, "member": member}
+        host.peer_workflows = by_name
+        member.peer_workflows = by_name
+        host.state = "completed"
+        host.progress = 1.0
+        host.job_ids.add("99")
+        member.state = "started"
+        member.progress = 0.0
+        statuses = [
+            _idle_incomplete_status(progress=1.0, state="completed",
+                                    finished=True),
+            _idle_incomplete_status(progress=1.0, state="completed",
+                                    finished=True),
+            _idle_incomplete_status(progress=1.0, state="completed",
+                                    finished=True),
+        ]
+        asyncio.run(_run_monitor_with_statuses(host, monkeypatch, statuses))
+        assert host.state == "unstarted"
+        assert host.job_ids == set()
+
+    def test_sticky_job_ids_finished_set_exits(
+            self, monkeypatch, seekr_run_module):
+        host = _make_remote_stage_workflow(
+            seekr_run_module, name="host", fused_after=["member"])
+        member = _make_remote_stage_workflow(
+            seekr_run_module, fusion_host="host", name="member")
+        by_name = {"host": host, "member": member}
+        host.peer_workflows = by_name
+        member.peer_workflows = by_name
+        host.job_ids.add("99")
+        member.state = "completed"
+        statuses = [
+            {
+                "success": True,
+                "manager_status": {"jobs": []},
+                "stage_status": {
+                    "state": "completed",
+                    "progress": 1.0,
+                    "finished": True,
+                },
+            },
+        ]
+        n_calls = asyncio.run(
+            _run_monitor_with_statuses(host, monkeypatch, statuses))
+        assert n_calls == 1
+        assert host.task is None
+        assert host.state == "completed"
+
+
+def _missing_model_status(*, jobs: list | None = None) -> dict:
+    return {
+        "success": False,
+        "error": "Model file not found: /remote/model.json",
+        "manager_status": {"jobs": list(jobs or [])},
+        "stage_status": {
+            "state": "unstarted",
+            "notes": "Model file not found: /remote/model.json",
+            "model_xml_found": False,
+        },
+    }
+
+
+class TestMissingRemoteModelRelaunch:
+    def test_idle_scheduler_clears_stale_ids_and_relaunches(
+            self, monkeypatch, seekr_run_module):
+        sw = _make_remote_stage_workflow(seekr_run_module)
+        sw.job_ids.add("21265632")
+        n_calls = asyncio.run(
+            _run_monitor_with_statuses(
+                sw, monkeypatch, [_missing_model_status()]))
+        assert n_calls == 1
+        assert sw.state == "unstarted"
+        assert sw.job_ids == set()
+        assert sw.manager_status == "idle"
+        assert sw.last_error is None
+
+    def test_live_jobs_keep_monitoring(
+            self, monkeypatch, seekr_run_module):
+        sw = _make_remote_stage_workflow(seekr_run_module)
+        sw.job_ids.add("42")
+        statuses = [
+            _missing_model_status(
+                jobs=[{"JobID": "42", "State": "RUNNING"}]),
+        ]
+        n_calls = asyncio.run(
+            _run_monitor_with_statuses(sw, monkeypatch, statuses))
+        assert n_calls >= 1
+        assert sw.state == "started"
+        assert "42" in sw.job_ids
+        assert sw.manager_status == "running"
+        assert sw.status_polled_at is not None
+
+    def test_fused_member_inherits_host_scheduler_status(
+            self, monkeypatch, seekr_run_module):
+        host = _make_remote_stage_workflow(
+            seekr_run_module, name="host", fused_after=["member"])
+        member = _make_remote_stage_workflow(
+            seekr_run_module, fusion_host="host", name="member")
+        by_name = {"host": host, "member": member}
+        host.peer_workflows = by_name
+        member.peer_workflows = by_name
+        host.manager_status = "running"
+        host.status_polled_at = 123.0
+        host.job_ids.add("99")
+        statuses = [
+            {
+                "success": True,
+                "manager_status": {
+                    "jobs": [],
+                    "error": "No SLURM state file found for stage 'member'",
+                },
+                "stage_status": {
+                    "state": "started",
+                    "progress": 0.07,
+                    "finished": False,
+                },
+            },
+        ]
+        asyncio.run(
+            _run_monitor_with_statuses(member, monkeypatch, statuses))
+        assert member.manager_status == "running"
+        assert member.status_polled_at is not None

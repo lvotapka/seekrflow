@@ -369,6 +369,8 @@ class Logistic_swarm_from_reporter_stage_item(Stage_item_base):
         default="partitioned", validator=validators.instance_of(str))
     reporter_name: str = field(
         default="", validator=validators.instance_of(str))
+    number_of_velocity_resamples: int = field(
+        default=1, validator=validators.instance_of(int))
 
 
 Stage_item = MD_stage_item | BD_stage_item \
@@ -663,6 +665,8 @@ class Stage_procedure_base:
     position_reporter_interval: int | None = field(
         default=None,
         validator=validators.optional(validators.instance_of(int)))
+    run_minimization: bool = field(
+        default=False, validator=validators.instance_of(bool))
 
     def expand(
             self,
@@ -1211,6 +1215,7 @@ class Seeding_stage_procedure(Stage_procedure_base):
             raise ValueError(f"Unknown seeding method type: {self.method_input.type}")
         seed_stage = MD_stage_item(
             name=seed_name,
+            run_minimization=self.run_minimization,
             scope="unpartitioned",
             ensemble=self.ensemble,
             sampling=sampling,
@@ -1259,6 +1264,7 @@ class MMVT_stage_procedure(Stage_procedure_base):
             ) -> list[Resolved_stage_item]:
         mmvt_stage = MD_stage_item(
             name=self.name,
+            run_minimization=self.run_minimization,
             scope="partitioned",
             ensemble=self.ensemble,
             checkpoint_interval=self.checkpoint_interval,
@@ -1317,6 +1323,8 @@ class RAMD_stage_procedure(Stage_procedure_base):
     #  be objects like Sampling_spec.
     swarm_size: int = field(
         default=20, validator=validators.instance_of(int))
+    number_of_velocity_resamples: int = field(
+        default=1, validator=validators.instance_of(int))
     starting_structure_interval: int = field(
         default=2000, validator=validators.instance_of(int))
     ligand_selection_name: str = field(
@@ -1380,7 +1388,7 @@ class RAMD_stage_procedure(Stage_procedure_base):
         #reporter_name = f"{self.name}_swarm_reporter"
         sampling_stage = MD_stage_item(
             name=sampling_name,
-            run_minimization=False,
+            run_minimization=self.run_minimization,
             ensemble=self.ensemble,
             sampling=equil_sampling,
             completion=Number_of_steps_completion_spec(
@@ -1393,6 +1401,7 @@ class RAMD_stage_procedure(Stage_procedure_base):
             name=assign_swarm_name,
             scope="partitioned",
             reporter_name=reporter_name,
+            number_of_velocity_resamples=self.number_of_velocity_resamples,
         )
         ramd_stage = MD_stage_item(
             name=ramd_name,

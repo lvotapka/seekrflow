@@ -14,6 +14,7 @@ import seekrflow.modules.workload_managers.slurm as workload_slurm
 import seekrflow.modules.workload_managers.pbs as workload_pbs
 import seekrflow.modules.workload_managers.aws as workload_aws
 import seekrflow.modules.workload_managers.dispatch_lowering as dispatch_lowering
+import seekrflow.modules.workload_managers.remote_stage_lifecycle as remote_stage_lifecycle
 import seekrflow.modules.remote_interfaces.globus_compute_sdk as remote_globus
 import seekrflow.modules.remote_interfaces.ssh as remote_ssh
 import seekrflow.modules.remote_interfaces.local_shell as remote_local_shell
@@ -132,11 +133,16 @@ def submit_remote_workflow(
         resource_name: str,
         workflow: typing.Any,
         extra_args: list | None = None,
-        silent: bool = False
+        silent: bool = False,
+        kind: str = "submit",
         ) -> dict:
     """
     Check if the SEEKR calculation has finished remotely. Submit a Globus Compute
     or SSH workflow to obtain this.
+
+    ``kind`` is the batch Globus lock priority
+    (``cancel`` / ``submit`` / ``status_focused`` / ``status``). Ignored for
+    SSH and local_shell.
     """
     resource: structures.Resource_remote_base \
         = seekrflow.run_settings.get_resource_by_name(resource_name)
@@ -157,7 +163,7 @@ def submit_remote_workflow(
         endpoint = resource.remote_interface.endpoint_id
         result = remote_globus\
             .submit_remote_workflow_with_globus_compute(
-                resource.name, workflow, endpoint, args, silent)
+                resource.name, workflow, endpoint, args, silent, kind=kind)
     elif resource.remote_interface.type == "ssh":
         hostname = resource.remote_interface.hostname
         username = resource.remote_interface.username
@@ -191,6 +197,7 @@ def status_remote(
         benchmark_mode: bool = False,
         host_stage_name: str | None = None,
         announce_failure: bool = True,
+        globus_kind: str = "status",
         ) -> dict:
     """
     Generalized remote/cloud stage status query for any stage whose producing
@@ -235,6 +242,8 @@ def status_remote(
             "any",
             None,
             getattr(resource, "worker_init", "") or "",
+            remote_stage_lifecycle.remote_scheduler_job_name(
+                seekrflow.name, host_stage_name or stage_name),
         ]
         if resource.type == "slurm_remote":
             status_workflow = workload_slurm.slurm_remote_status_workflow
@@ -246,6 +255,7 @@ def status_remote(
             status_workflow,
             extra_args=extra_args,
             silent=silent,
+            kind=globus_kind,
         )
     else:
         raise NotImplementedError(
@@ -308,6 +318,7 @@ def fetch_unit_counts_remote(
         remote_run_python_snippet_workflow,
         extra_args=extra_args,
         silent=silent,
+        kind="submit",
     )
     if not result.get("success"):
         raise RuntimeError(
@@ -445,7 +456,8 @@ def submit_remote_run_workflow(
             f"Resource type {resource.type} is not implemented.")
 
     result = submit_remote_workflow(
-        seekrflow, resource.name, run_workflow, extra_args=args, silent=silent)
+        seekrflow, resource.name, run_workflow, extra_args=args,
+        silent=silent, kind="submit")
     return result
 
 
@@ -486,8 +498,9 @@ def submit_remote_cancel_workflow(
     else:
         raise NotImplementedError(f"Resource type {resource.type} not implemented")
 
-    submit_remote_workflow(seekrflow, resource_name,
-                           cancel_workflow, extra_args=extra_args, silent=silent)
+    submit_remote_workflow(
+        seekrflow, resource_name,
+        cancel_workflow, extra_args=extra_args, silent=silent, kind="cancel")
     return
 
 
@@ -547,7 +560,7 @@ def cancel_and_reset_remote_stage(
 
     result = submit_remote_workflow(
         seekrflow, resource_name, cancel_reset_workflow,
-        extra_args=[stage_name], silent=silent)
+        extra_args=[stage_name], silent=silent, kind="cancel")
 
     if result.get("canceled_job"):
         print(f"  Canceled job: {result['canceled_job']}")
