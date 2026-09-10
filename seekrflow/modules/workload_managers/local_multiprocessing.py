@@ -13,18 +13,18 @@ import multiprocessing
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict
 
-import seekrflow.modules.base as base
-
 # ============================================================================
 # Multiprocessing State Management (similar to SLURM RunState pattern)
 # ============================================================================
 
+# TODO: see if this would be better changed to a info/state file pair, similar
+# to the remote stage info/state files.
 @dataclass
 class LocalProcessState:
     """State information for a locally running multiprocessing process."""
     stage: str
     pid: int
-    status: str  # "running", "completed", "failed", "killed", "unknown"
+    status: str  # "unstarted", "started", "completed", "error"
     started_at: float
     ended_at: Optional[float]  # Set when process completes, fails, or is killed
     error: Optional[str]
@@ -164,7 +164,7 @@ def cleanup_old_state_files(
         except Exception as e:
             print(f"Warning: Could not delete old state file {state_file}: {e}")
 
-def check_for_existing_local_processes(
+def check_for_existing_local_process(
         root_dir: str, 
         stage_name: str,
         anchor: str = "any",

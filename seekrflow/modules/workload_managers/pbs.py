@@ -5,21 +5,6 @@ This module provides PBS/Torque equivalents to the SLURM workload manager functi
 following the same patterns and conventions.
 """
 
-def calculate_optimal_seekr_time_limit(
-    job_status_file: str,
-    incomplete_anchors: list[int],
-    default_time_limit: str
-) -> str:
-    """
-    Deprecated. Use ``walltime.estimate_submit_time_limit`` instead.
-
-    Kept as a no-op returning ``default_time_limit`` for older call sites/tests.
-    """
-    del job_status_file, incomplete_anchors
-    return default_time_limit
-
-
-
 def pbs_remote_status_workflow(args):
     """
     Generic PBS status workflow.

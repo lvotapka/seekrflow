@@ -48,12 +48,15 @@ FATAL_HTTP_STATUSES = frozenset({401, 403})
 
 # Live files the monitor writes while Globus is hashing the tree. Checksum
 # mismatch and vanished temps come from these, not from model.json.
+# TODO: are these even still used?
 STATUS_FILE_NAME = ".seekrflow_job_status.json"
 STATUS_TMP_GLOB = ".seekrflow_job_status.*"
 
 # Files that must exist on the destination after a forward transfer, when they
 # exist locally. A silently failed transfer used to look like success here,
 # which then showed up much later as a remote "Model file not found" error.
+# TODO: is this insufficient? What if the transfer is partially successful, 
+# and the model.json file is transferred, but some other key files are not?
 FORWARD_TRANSFER_SENTINELS = ("model.json",)
 
 

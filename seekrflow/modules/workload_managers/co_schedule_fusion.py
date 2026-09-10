@@ -137,7 +137,7 @@ def skips_remote_submit(stage_workflow) -> bool:
         and stage_workflow.resource_name != "local"
     )
 
-
+# TODO: see if this can be replaced/simplified.
 def is_fusion_host(stage_workflow) -> bool:
     """Remote stage that owns a fused job (submits the combined command)."""
     return (
@@ -306,7 +306,11 @@ def mark_fused_set_completed(
         sw.state = "completed"
         sw.progress = 1.0
 
-
+# TODO: I don't like this - I think it's part of an unnecessarily complex
+#  and vague procedure of choosing whether to attach or submit anew. This
+# decision should be made more easily based on the info and state files for 
+# slurm and stages from previous seekrflow instances, as well as what jobs
+# are currently running or queued.
 def classify_fused_probe_status(
         member_statuses: dict[str, dict | None],
         host_stage_name: str,
@@ -314,10 +318,18 @@ def classify_fused_probe_status(
         resume: bool = False,
         ) -> str:
     """
-    Classify a one-shot probe over all fused-set members.
+    Classify a remote status probe over all fused-set members.
 
     Returns ``completed``, ``reattach``, ``submit``, or ``defer``.
 
+    NOTE: This will be different now because of SLURM.
+    NOTE: resume is a hint from the caller that the fused job might 
+    have already been submitted, and currently running, and we should 
+    not submit again.
+    # TODO: I think we need a cleaner way to represent this and make this
+    # choice from the returned info and state files for slurm and stages.
+    
+    # AI generated docstring:
     Live jobs on any member reattach. Fused members often have no SLURM
     state file, so only the **host** queue reading can be uncertain.
     A failed or erroring host probe never submits (reattach if leftover
@@ -328,6 +340,7 @@ def classify_fused_probe_status(
     any_jobs = False
     all_completed = True
     for status in member_statuses.values():
+        # TODO: modify/cleanup because it should be easier to get this now.
         jobs = remote_stage_lifecycle.jobs_from_status(status)
         if jobs:
             any_jobs = True

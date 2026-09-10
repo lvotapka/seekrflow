@@ -8,10 +8,8 @@ import os
 import sys
 import time
 import json
-import glob
 import random
 import typing
-import select
 import signal
 import asyncio
 import datetime
@@ -32,6 +30,7 @@ from radical.asyncflow import WorkflowEngine, LocalExecutionBackend #, \
 #from rhapsody.telemetry import define_event
 #from rhapsody.telemetry.events import make_event
 
+# TODO: create a separate module for the live tables & GUI
 from rich.console import Console, Group
 from rich.live import Live
 from rich.table import Table
@@ -53,6 +52,22 @@ import seekrflow.modules.workload_managers.co_schedule_fusion as co_schedule_fus
 import seekrflow.modules.workload_managers.dispatch_lowering as dispatch_lowering
 import seekrflow.modules.workload_managers.remote_stage_lifecycle as remote_stage_lifecycle
 import seekrflow.modules.workload_managers.walltime as walltime
+
+combine_fused_commands = co_schedule_fusion.combine_fused_commands
+populate_fusion_map = co_schedule_fusion.populate_fusion_map
+fusion_dependencies_satisfied = co_schedule_fusion.fusion_dependencies_satisfied
+skips_remote_submit = co_schedule_fusion.skips_remote_submit
+is_fusion_host = co_schedule_fusion.is_fusion_host
+fusion_host_name = co_schedule_fusion.fusion_host_name
+mark_fused_set_completed = co_schedule_fusion.mark_fused_set_completed
+classify_fused_probe_status = co_schedule_fusion.classify_fused_probe_status
+remote_scheduler_job_name = remote_stage_lifecycle.remote_scheduler_job_name
+classify_remote_probe_status = remote_stage_lifecycle.classify_remote_probe_status
+remote_model_missing = remote_stage_lifecycle.remote_model_missing
+owns_scheduler_job = remote_stage_lifecycle.owns_scheduler_job
+remote_cancel_needed = remote_stage_lifecycle.remote_cancel_needed
+force_overwrite_skips_launch_probe = (
+    remote_stage_lifecycle.force_overwrite_skips_launch_probe)
 
 _RICH_CONSOLE = Console()
 
@@ -94,24 +109,26 @@ STATUS_CONTENTION_RETRY_S = 5.0
 POLL_SUCCESS_JITTER_FRAC = 0.2
 
 # Mutable poll interval so batch coordinators can slow background children.
+# TODO: remove these redundant things
 _runtime_polling_interval: float = POLLING_INTERVAL
 # Set when poll interval changes so long monitor sleeps wake early.
 _poll_wake_event: asyncio.Event | None = None
 _poll_wake_loop: asyncio.AbstractEventLoop | None = None
 
-
+# TODO: remove this unnecessary function
 def get_polling_interval() -> float:
     """Return the active monitor/scheduler poll interval in seconds."""
     return _runtime_polling_interval
 
-
+# TODO: very weird way to handle whether we are in focused mode
 def _globus_status_kind() -> str:
     """Focused rows poll at POLLING_INTERVAL; background rows are slower."""
     if get_polling_interval() <= POLLING_INTERVAL + 1e-6:
         return "status_focused"
     return "status"
 
-
+# TODO: we are going to remove and forget about capacity problems
+#  unless they appear again.
 def submit_failure_is_capacity(error: BaseException) -> bool:
     """
     True when a submit failed only because the resource had no room yet.
@@ -122,7 +139,6 @@ def submit_failure_is_capacity(error: BaseException) -> bool:
     endpoint that is offline.
     """
     return globus_compute_sdk.is_retryable_globus_error(error)
-
 
 def should_reattach_queued_jobs(stage_workflow: typing.Any) -> bool:
     """
@@ -152,7 +168,7 @@ def should_reattach_started_jobs(stage_workflow: typing.Any) -> bool:
         and getattr(stage_workflow, "resource_name", None) != "local"
     )
 
-
+# TODO: fusion jobs are being redone
 def fusion_host_needs_relaunch(
         stage_workflow: typing.Any,
         stage_by_name: dict,
@@ -225,27 +241,7 @@ async def _run_blocking(fn: typing.Callable[..., typing.Any], *args, **kwargs):
     Used for Globus / remote status and submit calls so the UI keystroke
     loop and Live display stay responsive while endpoints are slow.
     """
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, lambda: fn(*args, **kwargs))
-
-
-combine_fused_commands = co_schedule_fusion.combine_fused_commands
-populate_fusion_map = co_schedule_fusion.populate_fusion_map
-fusion_dependencies_satisfied = co_schedule_fusion.fusion_dependencies_satisfied
-skips_remote_submit = co_schedule_fusion.skips_remote_submit
-is_fusion_host = co_schedule_fusion.is_fusion_host
-fusion_host_name = co_schedule_fusion.fusion_host_name
-mark_fused_set_completed = co_schedule_fusion.mark_fused_set_completed
-classify_fused_probe_status = co_schedule_fusion.classify_fused_probe_status
-remote_scheduler_job_name = remote_stage_lifecycle.remote_scheduler_job_name
-classify_remote_probe_status = remote_stage_lifecycle.classify_remote_probe_status
-remote_model_missing = remote_stage_lifecycle.remote_model_missing
-owns_scheduler_job = remote_stage_lifecycle.owns_scheduler_job
-remote_cancel_needed = remote_stage_lifecycle.remote_cancel_needed
-force_overwrite_skips_launch_probe = (
-    remote_stage_lifecycle.force_overwrite_skips_launch_probe)
-
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 def _local_partition_progress(model, stage_name: str) -> dict | None:
     """Best-effort local seekr progress map for walltime estimation."""
@@ -641,7 +637,8 @@ def determine_stage_manager_status(manager_status: dict | None) -> str:
     else:
         return "unknown"
 
-
+# TODO: figure out if the stage-workflow needs to have multiple stages within it
+#  for batched remote jobs.
 @attrs.define
 class StageWorkflow:
     """
@@ -652,6 +649,7 @@ class StageWorkflow:
     seekrflow: structures.Seekrflow = attrs.field(repr=False)
     stage: scales_base.Base_stage = attrs.field(repr=False)
     workflow_engine: WorkflowEngine = attrs.field(repr=False)
+    # TODO: simplify to always using resource.name?
     resource_name: str = attrs.field(default="local")
     resource: structures.Resource_base | None = attrs.field(
         default=None, repr=False)
@@ -659,11 +657,12 @@ class StageWorkflow:
         default=None, repr=False)
 
     # Derived / mutable state
-    dependency_indices: list[int] = attrs.field(factory=list)
+    dependency_indices: list[int] = attrs.field(factory=list) # TODO: not used? Remove?
     dependency_tasks: list = attrs.field(factory=list)
     task: typing.Any = attrs.field(default=None, repr=False)
     process: multiprocessing.Process | None = attrs.field(
         default=None, repr=False)
+    # TODO: State of the stage: slurm has: 'unknown', 'unstarted', 'started', 'completed', 'error'
     state: str = attrs.field(
         default="unknown", validator=attrs.validators.in_(
             {"unknown", "unstarted", "started", "completed", "failed",
@@ -677,10 +676,11 @@ class StageWorkflow:
     progress: float = attrs.field(
         default=0.0, validator=attrs.validators.ge(0.0))
     transfer_from: str | None = attrs.field(default=None)
+    # TODO: rename to 'manager_state'
     manager_status: str = attrs.field(
         default="idle", validator=attrs.validators.in_(
             {"idle", "running", "queued", "running/queued", "unknown",
-             "gathering", "pending", "pulling"}))
+             "sending", "pending", "pulling"}))
     job_ids: set[str] = attrs.field(factory=set)
     subsequent_noncompleted_runs: int = attrs.field(default=0)
     last_progress: float = attrs.field(default=0.0)
@@ -690,13 +690,17 @@ class StageWorkflow:
     force_overwrite: bool = attrs.field(default=False)
     benchmark_mode: bool = attrs.field(default=False)
     detached_requested: bool = attrs.field(default=False)
+    # TODO: can these be replaced by the manager_state above?
     transfer_status: str = attrs.field(default="idle")
     transfer_direction: str | None = attrs.field(default=None)
     transfer_error: str | None = attrs.field(default=None)
     transfer_relaunch_count: int = attrs.field(default=0)
+
     last_error: str | None = attrs.field(default=None)
     last_raw_status: dict | None = attrs.field(default=None, repr=False)
     status_polled_at: float | None = attrs.field(default=None)
+
+    # Is this fusion scheme OK?
     co_schedule_with: str | None = attrs.field(default=None)
     fusion_host: str | None = attrs.field(default=None)
     fused_before: list[str] = attrs.field(factory=list)
@@ -708,8 +712,7 @@ class StageWorkflow:
 
     def __attrs_post_init__(self) -> None:
         """
-        Normalize resource fields so StageWorkflow is the single source of
-        truth for resource resolution.
+        Assign resource field from resource_name assigned in the input file.
         """
         if self.resource is not None:
             if self.resource_name == "local":
@@ -751,13 +754,16 @@ class StageWorkflow:
         self.task = monitor_only()
         await asyncio.sleep(0)
 
+    # TODO: When a new job is being decided whether to submit anew vs. reattach,
+    # we need a more surefire way of determining this based on the info/state
+    # files. Like
     async def probe_remote_launch(
             self,
             resume: bool | None = None,
             ) -> tuple[str, dict | None]:
         """
-        One-shot remote probe for fresh launch from ``unstarted`` / ``unknown``.
-
+        Used to determine whether, by submitting a job, would it 'step on'
+        an existing job that is already running or queued.
         Returns ``(action, status)`` where action is ``completed``,
         ``reattach``, ``submit``, or ``defer``.
         """
@@ -771,6 +777,18 @@ class StageWorkflow:
             member_statuses: dict[str, dict | None] = {}
             for stage_name in co_schedule_fusion.fused_set_members(self):
                 try:
+                    # TODO: the remote status workflow is returning something different now.
+                    # Specifically:
+                    """
+    result = {
+        "success": True,
+        "error": None,
+        "slurm_info": parse_json_file_to_dict(slurm_info_path),
+        "slurm_state": parse_json_file_to_dict(slurm_state_path),
+        "stage_info_dicts": stage_info_dicts,
+        "stage_state_dicts": stage_state_dicts,
+    }
+                    """
                     member_statuses[stage_name] = await _run_blocking(
                         workload_remote.status_remote,
                         self.seekrflow,
@@ -820,13 +838,17 @@ class StageWorkflow:
             resume=bool(resume),
         ), status
 
+    # TODO: this needs to be generalized to work for all transfer methods.
+    # But is otherwise useful.
     def apply_transfer_error(self, error: BaseException) -> None:
         """
-        Record a failed transfer. Retryable errors stay queued with semaphore
+        Upon a failed transfer, retryable errors stay queued with semaphore
         go, up to a small cap; everything else parks the stage on wait.
         """
         self.transfer_status = "failed"
         self.transfer_error = str(error)
+        # TODO: this seems to be highly specific to globus transfers, but 
+        # what about rsync?
         if transfer_base.is_retryable_transfer_error(error):
             self.transfer_relaunch_count += 1
             cap = transfer_globus.GLOBUS_TRANSFER_MAX_ATTEMPTS
@@ -835,7 +857,7 @@ class StageWorkflow:
                     f"transfer could not be confirmed after {cap} attempts "
                     f"({error}); files may already be remote")
                 self.semaphore = "wait"
-                self.state = "failed"
+                self.state = "error"
                 print(
                     f"[transfer] stage {self.stage.name} could not confirm "
                     f"copy after {cap} attempts; setting semaphore=wait. "
@@ -843,7 +865,7 @@ class StageWorkflow:
                 )
                 return
             self.last_error = f"transfer will be retried: {error}"
-            self.state = "queued"
+            self.state = "pending"
             print(
                 f"[transfer] stage {self.stage.name} transfer did not "
                 f"complete ({error}); staying queued "
@@ -852,14 +874,17 @@ class StageWorkflow:
             return
         self.last_error = f"transfer failed: {error}"
         self.semaphore = "wait"
-        self.state = "failed"
+        self.state = "error"
         print(
             f"[transfer] stage {self.stage.name} transfer failed; "
             f"setting semaphore=wait. error={error}"
         )
 
-    def _outbound_transfer_resources(self):
-        """Source/destination resources for the outbound copy, or (None, None)."""
+    def _get_transfer_resources(self):
+        """
+        Return the identities of the source and destination resources for
+        a transfer. None indicates the local 'resource'.
+        """
         if self.transfer_from is None:
             dep_index = getattr(self.stage, "input_stage_index", 0)
             if self.resource_name != "local" and dep_index <= 0:
@@ -876,8 +901,9 @@ class StageWorkflow:
         Used both from ``create_tasks`` (before sbatch) and when a resume
         reattaches to live jobs but the remote model.json is missing.
         """
-        src_resource, dst_resource = self._outbound_transfer_resources()
+        src_resource, dst_resource = self._get_transfer_resources()
         if src_resource is None and dst_resource is None:
+            # Local to local
             self.transfer_status = "skipped"
             self.transfer_error = None
             return
@@ -885,7 +911,7 @@ class StageWorkflow:
             self.transfer_status = "running"
             self.transfer_direction = "out"
             self.transfer_error = None
-            self.manager_status = "gathering"
+            self.manager_status = "sending"
             # A leftover poll timestamp would make the batch table skip
             # pending and show the previous run's queued/running labels.
             self.status_polled_at = None
@@ -920,32 +946,19 @@ class StageWorkflow:
             await self.create_monitor_only_task()
             return
 
-        # Transfer files if dependent stage resource is different
-        @self.workflow_engine.function_task
-        async def transfer_files(*args):
-            if self.transfer_from is None:
-                # For the first remote stage (no dependency), seed remote workdir
-                # from local so model/config files exist before submission.
-                dep_index = getattr(self.stage, "input_stage_index", 0)
-                if self.resource_name != "local" and dep_index <= 0:
-                    pass
-                else:
-                    self.transfer_status = "skipped"
-                    self.transfer_error = None
-                    return
-            self.push_files_outbound()
-            
         dep_index = getattr(self.stage, "input_stage_index", 0)
         should_transfer = bool(self.transfer_from) or (
             self.resource_name != "local" and dep_index <= 0
         )
+        # Transfer files if dependent stage resource is different
+        @self.workflow_engine.function_task
+        async def transfer_files(*args):
+            self.push_files_outbound()
+            
         if should_transfer:
             self.dependency_tasks.append(transfer_files(*self.dependency_tasks))
 
         # Run stage
-        # TODO: this becomes a combo of executing task submission, then also
-        #   monitoring the task and updating progress, state, etc. based 
-        #   on telemetry.
         @self.workflow_engine.function_task
         async def run_stage(*args):
             if self.resource_name == "local":
@@ -958,15 +971,17 @@ class StageWorkflow:
                     # Force-rerun is a one-shot request.
                     self.force_overwrite = False
                 existing_state = workload_local_mp\
-                    .check_for_existing_local_processes(
+                    .check_for_existing_local_process(
                         self.model.directory, self.stage.name)
                 if existing_state and not force_overwrite_now:
                     # Note: We can't truly "reattach" to a multiprocessing.Process object,
                     # but we can track the PID and monitor/kill it via the state file
                     print(f"  Reattached to {self.stage.name} process (PID: {existing_state.pid})")
                     # self.process remains None - we'll use the PID from state file
-                    # TODO: does more need to be done here?
+                    # TODO: consider whether this is correctly implemented for batch jobs
+                    # after reviewing how it all works.
                     if self.holds_local_slot and self.local_slot_file:
+                        # Not ever done for flow.py
                         try:
                             import seekrflow.modules.batch.local_slots as \
                                 local_slots
@@ -2086,8 +2101,9 @@ class SeekrPipeline:
                     if jid:
                         sw.job_ids.add(str(jid))
             mgr = info.get("manager_status")
+            # TODO: check if more need to be added here.
             allowed_mgr = {
-                "idle", "unknown", "gathering", "pending", "pulling",
+                "idle", "unknown", "sending", "pending", "pulling",
             }
             # Do not restore running/queued/running/queued or
             # status_polled_at. Those labels are only valid after this
@@ -2883,7 +2899,7 @@ class SeekrPipeline:
         for stage_workflow in self.stage_workflows:
             if stage_workflow.resource_name != "local":
                 continue
-            existing_state = workload_local_mp.check_for_existing_local_processes(
+            existing_state = workload_local_mp.check_for_existing_local_process(
                 self.model.directory, stage_workflow.stage.name)
             if existing_state is not None:
                 print(
@@ -3133,7 +3149,7 @@ class SeekrPipeline:
                                 or self.model.directory)
                             existing_local = (
                                 workload_local_mp
-                                .check_for_existing_local_processes(
+                                .check_for_existing_local_process(
                                     self.model.directory,
                                     stage_workflow.stage.name))
                             acquired = local_slots.try_acquire(

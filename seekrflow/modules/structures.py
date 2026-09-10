@@ -549,6 +549,7 @@ class Placement:
 class Resolved_execution:
     """Fully-resolved, ready-to-run policy for one stage."""
     stage_name: str
+    # TODO: see if we can simplify to always using resource.name?
     resource_name: str
     resource: Resource_base | None
     dispatch: stage_procedures_module.Dispatch

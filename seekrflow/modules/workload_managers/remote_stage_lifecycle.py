@@ -6,11 +6,12 @@ Kept separate from seekr_run so unit tests do not require radical.asyncflow.
 from __future__ import annotations
 
 
+# TODO: if this is used, spread to other places where job names are needed/assigned.
 def remote_scheduler_job_name(seekrflow_name: str, stage_name: str) -> str:
     """Workload-manager job name for a stage launch."""
     return f"{seekrflow_name}_{stage_name}"
 
-
+# TODO: remove or perhaps revise - status result not the same anymore
 def remote_model_missing(status: dict | None) -> bool:
     """
     True when the remote workdir has no model.json.
@@ -28,6 +29,7 @@ def remote_model_missing(status: dict | None) -> bool:
     return "model file not found" in notes.lower()
 
 
+# TODO: status returns will be different now - remove?
 def scheduler_queue_uncertain(status: dict | None) -> bool:
     """
     True when squeue/qstat was not a clean empty-or-live reading.
@@ -46,6 +48,7 @@ def scheduler_queue_uncertain(status: dict | None) -> bool:
     return bool(str(mgr.get("error") or "").strip())
 
 
+# TODO: status returns will be different now - remove?
 def jobs_from_status(status: dict | None) -> list:
     if not isinstance(status, dict):
         return []

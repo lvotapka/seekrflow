@@ -12,7 +12,7 @@ import seekrflow.modules.transfer.globus as transfer_globus
 import seekrflow.modules.transfer.rsync as transfer_rsync
 import seekrflow.modules.transfer.aws_s3 as transfer_aws_s3
 
-
+# This is highly specific to globus transfers, but what about rsync and s3?
 def is_retryable_transfer_error(error: BaseException) -> bool:
     """
     True when a failed transfer is worth retrying automatically.
@@ -75,5 +75,5 @@ def transfer_files_to_from_remote_resource(
 
     else:
         raise NotImplementedError(
-            "Only rsync, globus, aws_s3, and none transfers are implemented.")
+            "Only rsync, globus, aws_s3 transfers are implemented.")
     return

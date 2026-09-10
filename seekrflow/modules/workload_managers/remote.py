@@ -26,7 +26,7 @@ def resource_kind(resource: structures.Resource_base | None) -> str:
         return "local"
     if resource.type in ("slurm_remote", "pbs_remote"):
         return "remote"
-    if resource.type == "aws_cloud":
+    if resource.type in ("aws_cloud", ):
         return "cloud"
     return "local"
 
@@ -40,7 +40,8 @@ def _get_stage_resource_name(
     return seekrflow.run_settings.resolve_stage_execution(
         stage_name, seekrflow.workflow.procedure).resource_name
 
-
+# TODO: this is going to change because what has returned will be different
+# from before.
 def _normalize_stage_status(
         status_result: dict,
         ) -> dict:
@@ -60,21 +61,8 @@ def _normalize_stage_status(
     finished = bool(stage_status.get("finished", False))
     notes = str(stage_status.get("notes", ""))
 
-    progress_raw = stage_status.get("progress", 0.0)
-    progress: float
-    if isinstance(progress_raw, (int, float)):
-        progress = float(progress_raw)
-    elif isinstance(progress_raw, str):
-        lowered = progress_raw.strip().lower()
-        if lowered in {"completed", "complete", "finished"}:
-            progress = 1.0
-        elif lowered in {"started", "running", "queued"}:
-            progress = 0.0
-        else:
-            progress = 0.0
-    else:
-        progress = 0.0
-
+    progress = stage_status.get("progress", 0.0)
+    
     state = stage_status.get("state")
     if state is None:
         if finished:
@@ -93,25 +81,6 @@ def _normalize_stage_status(
     stage_status["notes"] = notes
     return stage_status
 
-
-def calculate_optimal_time_limit(
-        seekrflow: structures.Seekrflow,
-        stage_name: str,
-        resource: structures.Resource_remote_base,
-        incomplete_anchors: list[int],
-        job_status_filename: str
-) -> str:
-    """
-    Deprecated legacy entry point.
-
-    Dynamic walltime now lives in ``walltime.estimate_submit_time_limit`` and
-    is applied at submit via ``Resolved_execution.time_policy``. This wrapper
-    returns the Resource ``time_limit`` unchanged.
-    """
-    del seekrflow, stage_name, incomplete_anchors, job_status_filename
-    return resource.time_limit
-
-
 def resolve_remote_model_directory(
         seekrflow: structures.Seekrflow,
         resource: structures.Resource_base,
@@ -128,17 +97,16 @@ def resolve_remote_model_directory(
     return os.path.join(resource.remote_working_directory, seekrflow.name)
 
 
-def submit_remote_workflow(
+def submit_remote_workload(
         seekrflow: structures.Seekrflow,
         resource_name: str,
-        workflow: typing.Any,
+        workload: typing.Any,
         extra_args: list | None = None,
         silent: bool = False,
         kind: str = "submit",
         ) -> dict:
     """
-    Check if the SEEKR calculation has finished remotely. Submit a Globus Compute
-    or SSH workflow to obtain this.
+    Submit a workflow to a remote resource.
 
     ``kind`` is the batch Globus lock priority
     (``cancel`` / ``submit`` / ``status_focused`` / ``status``). Ignored for
@@ -163,7 +131,7 @@ def submit_remote_workflow(
         endpoint = resource.remote_interface.endpoint_id
         result = remote_globus\
             .submit_remote_workflow_with_globus_compute(
-                resource.name, workflow, endpoint, args, silent, kind=kind)
+                resource.name, workload, endpoint, args, silent, kind=kind)
     elif resource.remote_interface.type == "ssh":
         hostname = resource.remote_interface.hostname
         username = resource.remote_interface.username
@@ -173,13 +141,13 @@ def submit_remote_workflow(
         private_key_passphrase = resource.remote_interface.private_key_passphrase
         result = remote_ssh\
             .submit_remote_workflow_with_ssh(
-                resource.name, workflow, args,  
+                resource.name, workload, args,  
                 hostname, username, password, port,
                 private_key_filename, private_key_passphrase)
     elif resource.remote_interface.type == "local_shell":
         result = remote_local_shell\
             .submit_remote_workflow_with_local_shell(
-                resource.name, workflow, args,
+                resource.name, workload, args,
                 python_executable=resource.remote_interface.python_executable,
                 silent=silent)
     else:
@@ -191,11 +159,11 @@ def submit_remote_workflow(
 
 def status_remote(
         seekrflow: structures.Seekrflow,
-        stage_name: str,
+        stage_name: str, # TODO: stage names
         model: typing.Any,
         silent: bool = False,
-        benchmark_mode: bool = False,
-        host_stage_name: str | None = None,
+        benchmark_mode: bool = False, # TODO: confirm whether benchmark is needed to know.
+        host_stage_name: str | None = None, # TODO: rethink how stage batches are handled.
         announce_failure: bool = True,
         globus_kind: str = "status",
         ) -> dict:
@@ -221,35 +189,29 @@ def status_remote(
     kind = resource_kind(resource)
 
     if kind == "cloud":
-        model_directory = getattr(model, "directory", None) or "."
         result = workload_aws.status_aws(
             seekrflow,
             stage_name,
             resource,
-            model_directory,
+            model.directory,
             host_stage_name=host_stage_name,
             benchmark_mode=benchmark_mode,
             announce_failure=announce_failure,
         )
     elif kind == "remote":
         # Note: positional args slot — the SLURM status workflow expects
-        # args[0]=working_dir, [1]=stage_name, [2]=benchmark_mode, [3]=anchor,
-        # [4]=swarm_id, [5]=worker_init.  worker_init is shelled into a bash -lc
-        # invocation inside the workflow so it can activate the env that has seekr.
+        # args[0]=root_dir, [1]=internal_id, [2]=stage_indices.  worker_init 
+        # is shelled into a bash -lc invocation inside the workflow so it can 
+        # activate the env that has seekr.
         extra_args: list[typing.Any] = [
-            stage_name,
-            benchmark_mode,
-            "any",
-            None,
-            getattr(resource, "worker_init", "") or "",
-            remote_stage_lifecycle.remote_scheduler_job_name(
-                seekrflow.name, host_stage_name or stage_name),
+            internal_id,
+            stage_indices
         ]
         if resource.type == "slurm_remote":
             status_workflow = workload_slurm.slurm_remote_status_workflow
         else:
             status_workflow = workload_pbs.pbs_remote_status_workflow
-        result = submit_remote_workflow(
+        result = submit_remote_workload(
             seekrflow,
             resource_name,
             status_workflow,
@@ -265,14 +227,16 @@ def status_remote(
     # Normalize stage_status regardless of success so callers always have
     # manager_status / job list available (e.g. for display while seekr module
     # is unavailable in the status-check environment).
+    # TODO: remove?
     result["stage_status"] = _normalize_stage_status(result)
     return result
 
-def remote_run_python_snippet_workflow(args):
+# NOTE: used in fetch_unit_counts_remote
+def remote_run_python_snippet_workload(args):
     """Run a python snippet on the remote worker; return raw stdout/stderr.
-    Args: [working_dir, snippet, worker_init]. Stdlib only (no seekrflow)."""
+    Args: [root_dir, snippet, worker_init]. Stdlib only (no seekrflow)."""
     import shlex, pathlib, subprocess
-    working_dir, snippet = args[0], args[1]
+    root_dir, snippet = args[0], args[1]
     worker_init = args[2] if len(args) > 2 else ""
     init = (worker_init or "").strip()
     cmd = (f"{init}; python -c {shlex.quote(snippet)}" if init
@@ -286,7 +250,9 @@ def remote_run_python_snippet_workflow(args):
     except Exception as e:
         return {"success": False, "error": str(e), "stdout": "", "stderr": ""}
 
-
+# TODO: this function is used to obtain numbers of swarms, and maybe anchors,
+# after a previous generating stage has finished. Could this be replaced by 
+# Stage Info objects pulled before the stage needing them?
 def fetch_unit_counts_remote(
         seekrflow: structures.Seekrflow,
         launching_stage: typing.Any,
@@ -326,18 +292,16 @@ def fetch_unit_counts_remote(
     return dispatch_lowering.parse_info_fetch_output(
         result.get("stdout", ""))
 
-
-def submit_remote_run_workflow(
+# TODO: add swarm indices/anchor indices or get from dispatch?
+def submit_remote_run_workload(
         seekrflow: structures.Seekrflow,
+        # TODO: should there be a list of stages and stage names?
         stage_name: str,
         destination_path: str,
         resource: structures.Resource_base,
         command_string: str,
-        model_filename: str,
-        workflow_type: str,
-        indices: list | None = None,
+        array_indices: list | None = None,
         silent: bool = False,
-        anchor_times: dict | None = None,
         time_limit_override: str | None = None,
         stage_specs: list[dict] | None = None,
         model_directory: str | None = None,
@@ -376,8 +340,8 @@ def submit_remote_run_workflow(
             resolved_execution.memory_mb
             if resolved_execution is not None else None)
         array_size = None
-        if indices is not None and len(indices) > 1:
-            array_size = len(indices)
+        if array_indices is not None and len(array_indices) > 1:
+            array_size = len(array_indices)
         return workload_aws.submit_aws_job(
             seekrflow,
             stage_name,
@@ -409,59 +373,60 @@ def submit_remote_run_workflow(
         time_limit = resource.time_limit
 
     log_directory = os.path.join(destination_path, "logs")
-    name = seekrflow.name + "_" + stage_name
+    # TODO: concatenate stage names, or maybe add 'etc' or 'plusN' for non-host stages?
+    # TODO: use remote_stage_lifecycle.remote_scheduler_job_name?
+    job_name = seekrflow.name + "_" + stage_name
     effective_time_limit = time_limit_override or time_limit
+    # TODO: collapse SLURM and PBS to a single module. (DRY)
     if resource.type == "slurm_remote":
         args = [
-            stage_name,
-            log_directory,
             resource.partition,
             resource.account,
             resource.constraint,
-            name,
+            job_name,
             cpus,
             memory_mb,
             effective_time_limit,
             resource.scheduler_options,
             resource.worker_init,
             command_string,
-            indices,
-            model_filename,
-            workflow_type,
-            anchor_times
+            array_indices,
+            stage_indices,
+            anchor_indices,
+            swarm_indices,
+            benchmark_mode
         ]
-        run_workflow = workload_slurm.slurm_remote_run_workflow
+        run_workload = workload_slurm.slurm_remote_run_workload
     elif resource.type == "pbs_remote":
         args = [
-            stage_name,
-            log_directory,
-            resource.queue,              # PBS equivalent of partition
+            resource.queue,
             resource.account,
-            resource.resource_list,      # PBS equivalent of constraint
-            name,
+            resource.constraint,
+            job_name,
             cpus,
             memory_mb,
             effective_time_limit,
             resource.scheduler_options,
             resource.worker_init,
             command_string,
-            indices,
-            model_filename,
-            workflow_type,
-            anchor_times
+            array_indices,
+            stage_indices,
+            anchor_indices,
+            swarm_indices,
+            benchmark_mode
         ]
-        run_workflow = workload_pbs.pbs_remote_run_workflow
+        run_workload = workload_pbs.pbs_remote_run_workload
     else:
         raise NotImplementedError(
             f"Resource type {resource.type} is not implemented.")
 
-    result = submit_remote_workflow(
-        seekrflow, resource.name, run_workflow, extra_args=args,
+    result = submit_remote_workload(
+        seekrflow, resource.name, run_workload, extra_args=args,
         silent=silent, kind="submit")
     return result
 
 
-def submit_remote_cancel_workflow(
+def submit_remote_cancel_workload(
         seekrflow: structures.Seekrflow,
         resource_name: str,
         job_id: str | None = None,
@@ -492,24 +457,27 @@ def submit_remote_cancel_workflow(
             extra_args.append(job_name)
 
     if resource.type == "slurm_remote":
-        cancel_workflow = workload_slurm.slurm_remote_cancel_workflow
+        cancel_workload = workload_slurm.slurm_remote_cancel_workload
     elif resource.type == "pbs_remote":
-        cancel_workflow = workload_pbs.pbs_remote_cancel_workflow
+        cancel_workload = workload_pbs.pbs_remote_cancel_workload
     else:
         raise NotImplementedError(f"Resource type {resource.type} not implemented")
 
-    submit_remote_workflow(
+    submit_remote_workload(
         seekrflow, resource_name,
-        cancel_workflow, extra_args=extra_args, silent=silent, kind="cancel")
+        cancel_workload, extra_args=extra_args, silent=silent, kind="cancel")
     return
 
-
+# TODO: why don't we use cancel and reset all the time?
+#  answer: we don't use the one above, but we need a way
+#  to obtain the job id or name to cancel from the stage name(s)
+#  and the internal id. 
 def cancel_and_reset_remote_stage(
         seekrflow: structures.Seekrflow,
-        stage_name: str,
+        stage_name: str, # TODO: stage names
         silent: bool = False,
         model_directory: str | None = None,
-        monitor_stage_names: list[str] | None = None,
+        monitor_stage_names: list[str] | None = None, # TODO: remove
         ) -> None:
     """
     Cancel a stage's remote/cloud job and reset its scheduler/runner bookkeeping.
@@ -558,7 +526,7 @@ def cancel_and_reset_remote_stage(
     else:
         raise NotImplementedError(f"Resource type {resource.type} not implemented")
 
-    result = submit_remote_workflow(
+    result = submit_remote_workload(
         seekrflow, resource_name, cancel_reset_workflow,
         extra_args=[stage_name], silent=silent, kind="cancel")
 

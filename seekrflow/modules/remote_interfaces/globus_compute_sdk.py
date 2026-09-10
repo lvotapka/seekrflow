@@ -403,7 +403,7 @@ def _tagged_exception(exc: BaseException, side: str) -> BaseException:
         return GlobusRetryableError(msg)
     return RuntimeError(msg)
 
-
+# TODO: remove 'kinds' and consider whether to keep lock functionality.
 def submit_remote_workflow_with_globus_compute(
         name: str,
         workflow: typing.Any,
