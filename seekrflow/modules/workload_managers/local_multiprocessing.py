@@ -11,29 +11,63 @@ import json
 import signal
 import multiprocessing
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 # ============================================================================
-# Multiprocessing State Management (similar to SLURM RunState pattern)
+# Multiprocessing Info/State Management
 # ============================================================================
 
-# TODO: see if this would be better changed to a info/state file pair, similar
-# to the remote stage info/state files.
+@dataclass
+class LocalProcessInfo:
+    """Unchanging nformation for a locally running multiprocessing process."""
+    stage_name: str
+    pid: int
+    started_at: float
+    root_dir: str
+    output_file: str
+    anchor: str
+    swarm_id: int | None
+    device_index: str | None
+    force_overwrite: bool
+    benchmark_mode: bool
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+    
+    @staticmethod
+    def from_dict(data: dict) -> "LocalProcessInfo":
+        """Create from dictionary loaded from JSON."""
+        return LocalProcessInfo(**data)
+    
+    @staticmethod
+    def load(path: str) -> "LocalProcessInfo":
+        """Load state from file."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        return LocalProcessInfo.from_dict(data)
+    
+    def save(self, path: str) -> None:
+        """Save state to file."""
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=4)
+
 @dataclass
 class LocalProcessState:
-    """State information for a locally running multiprocessing process."""
-    stage: str
-    pid: int
-    status: str  # "unstarted", "started", "completed", "error"
-    started_at: float
+    """Transient information for a locally running multiprocessing process."""
+    stage_state: str  # "unstarted", "started", "completed", "error", "unknown"
+    manager_state: str  # 'pending', 'running', 'idle', 'failed', 'cancelled'
+    finished: bool
+    progress: float
     ended_at: Optional[float]  # Set when process completes, fails, or is killed
     error: Optional[str]
     traceback: Optional[str]
-    model_file: str
-    work_dir: str
-    # Stage-specific progress information
-    progress_info: Optional[Dict] = None
-    
+    notes: Optional[str]
+    #TODO: replace this variable with fields in the info/state objects
+    #progress_info: Optional[Dict] = None # Stage-specific progress information
+    imports_successful: bool
+    model_loaded: bool
+
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
@@ -59,20 +93,20 @@ class LocalProcessState:
 def get_local_state_dir(root_dir: str) -> str:
     """
     Get the directory for local multiprocessing state files.
-    Located next to model.xml in the root directory.
+    Located next to model.json in the root directory.
     """
     state_dir = os.path.join(
         root_dir, ".multiprocessing")
     os.makedirs(state_dir, exist_ok=True)
     return state_dir
 
-def get_local_state_file(
+def get_local_info_and_state_files(
         root_dir: str, 
-        stage: str, 
+        stage_name: str, 
         pid: int,
         anchor: str = "any",
         swarm_id: int | None = None
-        ) -> str:
+        ) -> Tuple[str, str]:
     """
     Get the state file path for a local process.
     Includes PID in filename to avoid conflicts.
@@ -86,8 +120,13 @@ def get_local_state_file(
     if swarm_id is not None:
         swarm_id_str = f"swarm_{swarm_id}_"
 
-    return os.path.join(
-        state_dir, f"{stage}_{anchor_str}{swarm_id_str}state_{pid}.json")
+    info_name = os.path.join(
+        state_dir, f"{stage_name}_{anchor_str}{swarm_id_str}info_{pid}.json")
+
+    state_name = os.path.join(
+        state_dir, f"{stage_name}_{anchor_str}{swarm_id_str}state_{pid}.json")
+
+    return info_name, state_name
 
 
 def check_pid_exists(pid: int) -> bool:
@@ -102,18 +141,20 @@ def check_pid_exists(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        return True
     except OSError:
         return False
 
-def find_latest_state_file(
+def find_latest_info_and_state_files(
         root_dir: str, 
         stage_name: str,
         anchor: str = "any",
         swarm_id: int | None = None
-        ) -> Optional[str]:
+        ) -> Optional[Tuple[str, str]]:
     """
     Find the most recent state file for a given stage.
-    Returns None if no state files exist for this stage.
+    Returns (None, None) if no state files exist for this stage.
     """
     state_dir = get_local_state_dir(root_dir)
     anchor_str = ""
@@ -126,77 +167,52 @@ def find_latest_state_file(
     state_glob = os.path.join(state_dir, pattern)
     state_files = list(glob.glob(state_glob))
     if not state_files:
-        return None
+        return None, None
     state_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return state_files[0]
-
-def cleanup_old_state_files(
-        root_dir: str, 
-        stage_name: str, 
-        anchor: str = "any",
-        swarm_id: int | None = None,
-        keep_latest: bool = True):
-    """
-    Clean up old state files for a stage, optionally keeping the latest one.
-    """
-    state_dir = get_local_state_dir(root_dir)
-    anchor_str = ""
-    if anchor != "any":
-        anchor_str = f"anchor_{anchor}_"
-    swarm_id_str = ""
-    if swarm_id is not None:
-        swarm_id_str = f"swarm_{swarm_id}_"
-    pattern = f"{stage_name}_{anchor_str}{swarm_id_str}state_*.json"
-    state_files = list(state_dir.glob(pattern))
-    
-    if not state_files:
-        return
-    
-    # Sort by modification time
-    state_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    
-    # Determine which files to delete
-    files_to_delete = state_files[1:] if keep_latest else state_files
-    
-    for state_file in files_to_delete:
-        try:
-            state_file.unlink()
-        except Exception as e:
-            print(f"Warning: Could not delete old state file {state_file}: {e}")
+    state_file = state_files[0]
+    info_file = state_file.replace("state_", "info_")
+    if not os.path.exists(info_file):
+        return None, None
+    return info_file, state_file
 
 def check_for_existing_local_process(
         root_dir: str, 
         stage_name: str,
         anchor: str = "any",
         swarm_id: int | None = None
-        ) -> Optional[LocalProcessState]:
+        ) -> Optional[LocalProcessInfo]:
     """
     Check if there's a process from a previous run still active.
-    Returns the process state if found and running, None otherwise.
+    Returns the process info file if found and running, None otherwise.
+    The info file is found because the PID is needed sometimes.
     
     This is used for reattachment after detaching with 'd' command,
     and for monitoring.
     """
-    state_file = find_latest_state_file(
+    info_file, state_file = find_latest_info_and_state_files(
         root_dir, stage_name, anchor, swarm_id)
-    if not state_file or not os.path.exists(state_file):
+    #info_file, state_file = get_local_info_and_state_files(
+    #    root_dir, stage_name, anchor, swarm_id)
+    if not info_file or not os.path.exists(info_file) or not state_file \
+            or not os.path.exists(state_file):
         return None
     
     try:
         state = LocalProcessState.load(state_file)
+        info = LocalProcessInfo.load(info_file)
         
         # Only consider it if it's marked as running
-        if state.status == "running":
+        if state.manager_state in ["running", "pending"]:
             # Verify the PID actually exists
-            if check_pid_exists(state.pid):
+            if check_pid_exists(info.pid):
                 print(f"Found existing {stage_name} process from previous "\
-                      f"session (PID: {state.pid})")
-                return state
+                      f"session (PID: {info.pid})")
+                return info
             else:
                 # Process died without updating state file
                 print(f"Found stale {stage_name} state file - " \
-                      f"process {state.pid} no longer exists")
-                state.status = "unknown"
+                      f"process {info.pid} no longer exists")
+                state.manager_state = "failed"
                 state.ended_at = time.time()
                 state.error = "Process terminated unexpectedly"
                 state.save(state_file)
@@ -217,7 +233,7 @@ def status_local(
         ) -> dict: 
     """
     Check if the stage has finished locally. This is done by:
-    1. Checking the process state file
+    1. Checking the process info/state files
     2. Checking if the process is still alive
     3. Reading the results XML files to see how many steps have elapsed
     """
@@ -226,19 +242,40 @@ def status_local(
     import traceback
     
     # Check for state file
-    state_file = find_latest_state_file(root_dir, stage_name)
+    info_file, state_file = find_latest_info_and_state_files(
+        root_dir, stage_name, anchor, swarm_id)
+    if not info_file or not state_file:
+        return {
+            "success": False,
+            "error": "No local process info/state files found",
+            "process_info": None,
+            "process_state": None,
+        }
+        
+    process_info = None
     process_state = None
+    try:
+        process_info = LocalProcessInfo.load(info_file)
+    except Exception as e:
+        print(f"Warning: Could not load local process info file: {e}")
+        return {
+            "success": False,
+            "error": f"Could not load local process info file: {e}",
+            "process_info": None,
+            "process_state": None,
+        }
+    try:
+        process_state = LocalProcessState.load(state_file)
+    except Exception as e:
+        print(f"Warning: Could not load local process state file: {e}")
+        return {
+            "success": False,
+            "error": f"Could not load local process state file: {e}",
+            "process_info": None,
+            "process_state": None,
+        }
     
-    if state_file and os.path.exists(state_file):
-        try:
-            process_state = LocalProcessState.load(state_file)
-        except Exception as e:
-            print(f"Warning: Could not load BD state file: {e}")
-    
-    benchmark_mode = False
-    if process_state is not None and process_state.progress_info is not None:
-        benchmark_mode = bool(
-            process_state.progress_info.get("benchmark_mode", False))
+    benchmark_mode = bool(process_info.benchmark_mode)
     
     # TODO: perhaps extract this from the state file instead?
     if anchor == "any":
@@ -246,9 +283,13 @@ def status_local(
     else:
         partitioned_arg = anchor
 
-    stage_status = {}
-    stage_status["model_xml_found"] = True
-    stage_status["notes"] = ""
+    current_run_alive = False
+    if stage_process is not None and stage_process.is_alive():
+        current_run_alive = True
+    elif process_state is not None \
+            and process_state.manager_state == "running" \
+            and check_pid_exists(process_info.pid):
+        current_run_alive = True
 
     if benchmark_mode:
         # status.py doesn't know benchmark-mode criteria. For benchmark runs,
@@ -257,22 +298,18 @@ def status_local(
         if stage_process is not None and stage_process.is_alive():
             running_now = True
         elif process_state is not None \
-                and process_state.status == "running" \
-                and check_pid_exists(process_state.pid):
+                and process_state.manager_state == "running" \
+                and check_pid_exists(process_info.pid):
             running_now = True
 
-        if process_state is not None and process_state.status == "completed":
-            stage_status["finished"] = True
-            stage_status["state"] = "completed"
-            stage_status["progress"] = 1.0
+        if process_state is not None and process_state.stage_state == "completed":
+            process_state.finished = True
         elif running_now:
-            stage_status["finished"] = False
-            stage_status["state"] = "started"
-            stage_status["progress"] = 0.0
+            process_state.finished = False
+            process_state.progress = 0.0
         else:
-            stage_status["finished"] = False
-            stage_status["state"] = "unstarted"
-            stage_status["progress"] = 0.0
+            process_state.finished = False
+            process_state.progress = 0.0
     else:
         # Check actual simulation progress from model files
         model_filename = os.path.join(root_dir, "model.json")
@@ -304,14 +341,16 @@ def status_local(
         except Exception as e:
             # Update state to failed (process itself updates this)
             print(f"\nStage {stage_index} status check failed: {e}")
-            traceback.print_exc()
-            sys.stdout.flush()
-            raise  # Re-raise so process exits with error code
+            return {
+                "success": False,
+                "error": f"Stage {stage_index} status check failed: {e}",
+                "process_info": process_info.to_dict(),
+                "process_state": process_state.to_dict(),
+            }
 
         if stage_progress.get("finished", False):
-            stage_status["finished"] = True
-            stage_status["state"] = "completed"
-            stage_status["progress"] = 1.0
+            process_state.finished = True
+            process_state.progress = 1.0
         else:
             progress_map = stage_progress.get("progress", {})
             if partitioned_arg is None:
@@ -343,18 +382,16 @@ def status_local(
                         f"{sorted(partitioned_status.keys())}")
                 progress = partitioned_status.get("progress", 0.0)
 
-            if progress > 0.0:
-                state = "started"
-            else:
-                state = "unstarted"
-            stage_status["finished"] = False
-            stage_status["state"] = state
-            stage_status["progress"] = progress
-            for key, value in partitioned_status.items():
-                if key != "progress":
-                    stage_status[key] = value
-
-    # seekr.status() above reflects model.json, which may still show a
+            if process_state.stage_state not in ["completed", "error"] \
+                    and process_state.manager_state not in ["cancelled", "failed", "idle"]:
+                if progress > 0.0 or current_run_alive:
+                    process_state.stage_state = "started"
+                else:
+                    process_state.stage_state = "unstarted"
+                process_state.finished = False
+                process_state.progress = progress
+            
+    # seekr.status() above may still show a
     # previous run as "finished" until the freshly-spawned child clears it
     # via force_overwrite. The orchestrator's own Process handle is the
     # authoritative source for whether the CURRENT run is still active:
@@ -363,110 +400,84 @@ def status_local(
     # latest-by-mtime file is the OLD "killed" record from the prior run
     # (the newly-spawned child hasn't written its state file yet due to
     # "spawn" import overhead).
-    current_run_alive = False
-    if stage_process is not None and stage_process.is_alive():
-        current_run_alive = True
-    elif process_state is not None \
-            and process_state.status == "running" \
-            and check_pid_exists(process_state.pid):
-        current_run_alive = True
 
-    if current_run_alive and stage_status["state"] == "completed":
-        stage_status["finished"] = False
-        stage_status["state"] = "started"
-    elif current_run_alive and stage_status["state"] == "unstarted":
+    if current_run_alive and process_state.stage_state == "completed":
+        process_state.finished = False
+        process_state.stage_state = "started"
+    elif current_run_alive and process_state.stage_state == "unstarted":
         # During partitioned runs, seekr.status can briefly return no progress
         # data even though the process is actively producing outputs.
-        stage_status["state"] = "started"
+        process_state.stage_state = "started"
+
+    if (not current_run_alive) and (process_state.finished) \
+            and (process_state.manager_state == "idle"):
+        process_state.stage_state = "completed"
 
     # If the child process finished cleanly (seekr_run.run returned without
     # raising), trust that terminal state only for benchmark runs. In BD
     # benchmark mode, do_run_instruction_bd intentionally wipes BD outputs
     # afterwards, so seekr.status can report finished=False/progress=0.0 and
     # the progress-derived state would otherwise pin to "unstarted" forever.
-    if benchmark_mode \
-            and not current_run_alive \
-            and process_state is not None \
-            and process_state.status == "completed" \
-            and stage_status["state"] != "completed":
-        stage_status["finished"] = True
-        stage_status["state"] = "completed"
-        # Preserve the underlying progress number so the UI can still show
-        # what seekr currently sees (e.g. 0.0 after benchmark cleanup).
-    
-    # Build manager status based on process state
-    stage_manager_status = {}
-    stage_manager_status["tool"] = "multiprocessing"
-    stage_manager_status["timestamp"] = time.time()
-    stage_manager_status["error"] = ""
-    stage_manager_status["jobs"] = []
+    # NOTE: Should now be unnecessary since we will be directly passing the 
+    # contents of the process state file to the orchestrator.
+    #if benchmark_mode \
+    #        and not current_run_alive \
+    #        and process_state is not None \
+    #        and process_state.stage_state == "completed" \
+    #        and stage_status["state"] != "completed":
+    #    process_state.finished = True
+    #    process_state.stage_state = "completed"
+    #    # Preserve the underlying progress number so the UI can still show
+    #    # what seekr currently sees (e.g. 0.0 after benchmark cleanup).
     
     # Check if process is running and build job object with integrated state
-    if stage_process is not None and stage_process.is_alive():
-        job = {
-            "JobID": f"local_pid_{stage_process.pid}",
-            "State": "RUNNING",
-            "PID": stage_process.pid
-        }
-        # Integrate process state info into job object
-        if process_state:
-            job["process_status"] = process_state.status
-            job["started_at"] = process_state.started_at
-            job["output_file"] = process_state.progress_info.get(
-                "output_file", "N/A") if process_state.progress_info \
-                else "N/A"
-        stage_manager_status["jobs"].append(job)
-    elif process_state:
+    #if stage_process is not None and stage_process.is_alive():
+    #    job = {
+    #        "JobID": f"local_pid_{stage_process.pid}",
+    #        "State": "RUNNING",
+    #        "PID": stage_process.pid
+    #    }
+    #    # Integrate process state info into job object
+    #    if process_state:
+    #        job["process_status"] = process_state.status
+    #        job["started_at"] = process_state.started_at
+    #        job["output_file"] = process_state.progress_info.get(
+    #            "output_file", "N/A") if process_state.progress_info \
+    #            else "N/A"
+    #    stage_manager_status["jobs"].append(job)
+    if process_state:
         # Check state file
-        if process_state.status == "running":
+        if process_state.manager_state in ["running", "pending"]:
             # Process claims to be running, verify
-            if check_pid_exists(process_state.pid):
-                job = {
-                    "JobID": f"local_pid_{process_state.pid}",
-                    "State": "RUNNING",
-                    "PID": process_state.pid,
-                    "process_status": process_state.status,
-                    "started_at": process_state.started_at,
-                    "output_file": process_state.progress_info.get(
-                        "output_file", "N/A") if process_state.progress_info \
-                        else "N/A"
-                }
-                stage_manager_status["jobs"].append(job)
-            else:
+            if not check_pid_exists(process_info.pid):
                 # Process died without updating state file
-                stage_status["notes"] = f"Process {process_state.pid} "\
+                process_state.manager_state = "failed"
+                process_state.notes = f"Process {process_info.pid} "\
                     "exited unexpectedly"
-                stage_manager_status["error"] = "Process crashed"
-                if not current_run_alive:
-                    stage_status["state"] = "failed"
-                    stage_status["finished"] = False
-        elif process_state.status in ["failed", "killed"]:
-            stage_status["notes"] = f"Process {process_state.status}: "\
+                process_state.error = "Process crashed"
+                if process_state.ended_at is None:
+                    process_state.ended_at = time.time()
+                process_state.finished = False
+
+        elif process_state.manager_state in ["failed", "cancelled"]:
+            process_state.notes = f"Process {process_state.manager_state}: "\
                 f"{process_state.error}"
-            if process_state.status == "failed":
-                stage_manager_status["error"] = process_state.error
-                # Surface a genuine failure so the monitor can react. Guard on
-                # current_run_alive so a stale "failed" record from a prior run
-                # (before a freshly-spawned child writes its own state file)
-                # does not mask an actively running stage.
-                if not current_run_alive:
-                    stage_status["state"] = "failed"
-                    stage_status["finished"] = False
-            # DON'T add job to jobs list - these processes are done and 
-            # not running, this allows stage_manager_status to be "idle" 
-            # so a new run can be submitted
+            if process_state.ended_at is None:
+                process_state.ended_at = time.time()
+            process_state.finished = False
     
+    process_state.save(state_file)
     results = {
         "success": True,
         "error": None,
-        "manager_status": stage_manager_status,
-        "stage_status": stage_status
+        "process_info": process_info.to_dict(),
+        "process_state": process_state.to_dict()
     }
     
     return results
      
 # ============================================================================
-# Local Execution Functions with State Management
+# Local Execution Function
 # ============================================================================
 
 def run_locally(
@@ -481,7 +492,8 @@ def run_locally(
         ):
     """
     Run seekr stage locally using multiprocessing.
-    Writes state file with PID for monitoring and reattachment.
+    Writes info/state files with PID for monitoring and reattachment, as well
+    as other information.
     Redirects stdout/stderr to {stage}_run.out.
     
     This function is executed in a separate process.
@@ -491,8 +503,9 @@ def run_locally(
     import os
     import sys
     import time
-    import traceback
     import signal
+    import pathlib
+    import traceback
     
     # Make this process a process group leader so all subprocesses 
     # (like openmm / nam_simulation) are in the same group and can 
@@ -501,7 +514,7 @@ def run_locally(
     
     pid = os.getpid()
     # TODO: check if this is a file or a dir
-    state_file = get_local_state_file(
+    info_file, state_file = get_local_info_and_state_files(
         root_dir, stage_name, pid, anchor, swarm_id)
     anchor_str = ""
     if anchor != "any":
@@ -509,76 +522,65 @@ def run_locally(
 
     swarm_id_str = ""
     if swarm_id is not None:
-        swarm_id_str = f"swarm_id_{swarm_id}_"
+        swarm_id_str = f"swarm_{swarm_id}_"
 
-    output_file = os.path.join(
-        root_dir, f"{stage_name}_{anchor_str}{swarm_id_str}run.out")
-    model_filename = os.path.join(root_dir, "model.json")
+    root_dir_path = pathlib.Path(root_dir)
+    log_dir_path = root_dir_path / "logs"
+    log_dir_path.mkdir(exist_ok=True)
+    output_file_path = log_dir_path / f"{stage_name}_{anchor_str}{swarm_id_str}run_{pid}.out"
+    model_filename_path = root_dir_path / "model.json"
     
     # Create initial state BEFORE redirecting output (so any errors 
     # are visible)
-    state = LocalProcessState(
-        stage=stage_name,
+    started_at = time.time()
+    process_info = LocalProcessInfo(
+        stage_name=stage_name,
         pid=pid,
-        status="running",
-        started_at=time.time(),
+        started_at=started_at,
+        root_dir=root_dir,
+        output_file=str(output_file_path),
+        anchor=anchor,
+        swarm_id=swarm_id,
+        device_index=device_index,
+        force_overwrite=force_overwrite,
+        benchmark_mode=benchmark_mode,
+    )
+    process_info.save(info_file)
+    process_state = LocalProcessState(
+        stage_state="unstarted",
+        manager_state="pending",
+        finished=False,
+        progress=0.0,
         ended_at=None,
         error=None,
         traceback=None,
-        model_file=model_filename,
-        work_dir=root_dir,
-        progress_info={
-            "output_file": str(output_file),
-            "anchor": anchor,
-            "swarm_id": swarm_id,
-            "device_index": device_index,
-            "force_overwrite": force_overwrite,
-            "benchmark_mode": benchmark_mode,
-            "imports_successful": False,
-            "model_loaded": False,
-            "finished": False
-        }
+        notes=None,
+        imports_successful=False,
+        model_loaded=False,
     )
-    
-    try:
-        # Write initial state file
-        state.save(state_file)
-        
-        # Create/update symlink to latest state file
-        latest_link = os.path.join(
-            root_dir, ".multiprocessing", f"{stage_name}_{anchor_str}latest.json")
-        if os.path.exists(latest_link) or os.path.islink(latest_link):
-            os.unlink(latest_link)
-        os.symlink(state_file, latest_link)
-        
-    except Exception as e:
-        # If we can't write state file, fail loudly BEFORE redirecting output
-        print(f"FATAL: Cannot create state file {state_file}: {e}", 
-              file=sys.stderr)
-        traceback.print_exc()
-        raise
+    process_state.save(state_file)
     
     # NOW redirect output at OS level using dup2 (so subprocesses via 
     # os.system() are also redirected)
     try:
         output_fd = os.open(
-            str(output_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            str(output_file_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         os.dup2(output_fd, 1)  # Redirect stdout (fd 1)
         os.dup2(output_fd, 2)  # Redirect stderr (fd 2)
         os.close(output_fd)
         
         # Also redirect at Python level for consistency
         # Line buffered, append mode
-        sys.stdout = open(output_file, 'a', buffering=1) 
+        sys.stdout = open(str(output_file_path), 'a', buffering=1) 
         sys.stderr = sys.stdout
     except Exception as e:
-        print(f"FATAL: Cannot redirect output to {output_file}: {e}", 
+        print(f"FATAL: Cannot redirect output to {output_file_path}: {e}", 
               file=sys.stderr)
         raise
     
-    print(f"{stage_name} stage started at {time.ctime()}")
+    print(f"{stage_name} stage started at {time.ctime(started_at)}")
     print(f"PID: {pid}")
-    print(f"Model file: {model_filename}")
+    print(f"Model file: {model_filename_path}")
     print(f"State file: {state_file}")
     print(f"Anchor(s): {anchor}")
     print(f"Device index: {device_index}")
@@ -590,12 +592,13 @@ def run_locally(
     
     # Handle termination signals to update state before exit
     def signal_handler(signum, frame):
-        print(f"\nReceived signal {signum}, updating state to 'killed'...")
+        print(f"\nReceived signal {signum}, updating state to 'cancelled'...")
         sys.stdout.flush()
-        state.status = "killed"
-        state.ended_at = time.time()
-        state.error = f"Process killed by signal {signum}"
-        state.save(state_file)
+        process_state.manager_state = "cancelled"
+        if process_state.ended_at is None:
+            process_state.ended_at = time.time()
+        process_state.error = f"Process killed by signal {signum}"
+        process_state.save(state_file)
         sys.exit(128 + signum)  # Standard exit code for signals
     
     signal.signal(signal.SIGTERM, signal_handler)
@@ -607,15 +610,16 @@ def run_locally(
         import seekr.run as seekr_run
         
         # Update state - imports successful
-        state.progress_info["imports_successful"] = True
-        state.save(state_file)
+        process_state.imports_successful = True
+        process_state.save(state_file)
         print("Imports successful")
         sys.stdout.flush()
         
         # Load model
-        model = structures.load_model(model_filename)
-        state.progress_info["model_loaded"] = True
-        state.save(state_file)
+        model = structures.load_model(str(model_filename_path))
+        process_state.model_loaded = True
+        process_state.manager_state = "running"
+        process_state.save(state_file)
         print("Model loaded")
         sys.stdout.flush()
         
@@ -627,20 +631,22 @@ def run_locally(
             swarm_id, benchmark=benchmark_mode)
         
         # Update state to completed (process itself updates this)
-        state.status = "completed"
-        state.ended_at = time.time()
-        state.progress_info["finished"] = True
-        state.save(state_file)
+        process_state.stage_state = "completed"
+        process_state.manager_state = "idle"
+        process_state.ended_at = time.time()
+        process_state.finished = True
+        process_state.save(state_file)
         print(f"\n{stage_name} completed at {time.ctime()}")
         sys.stdout.flush()
         
     except Exception as e:
         # Update state to failed (process itself updates this)
-        state.status = "failed"
-        state.error = str(e)
-        state.traceback = traceback.format_exc()
-        state.ended_at = time.time()
-        state.save(state_file)
+        process_state.manager_state = "failed"
+        process_state.stage_state = "error"
+        process_state.error = str(e)
+        process_state.traceback = traceback.format_exc()
+        process_state.ended_at = time.time()
+        process_state.save(state_file)
         print(f"\n{stage_name} failed: {e}")
         traceback.print_exc()
         sys.stdout.flush()
@@ -650,24 +656,30 @@ def run_locally(
 
 def kill_existing_local_stage_processes(
         stage_name: str,
-        root_directory_path: str,
+        root_dir: str,
         ) -> None:
     """
     Kill any running local processes for the given stage, identified via
-    state files in the .multiprocessing directory. Idempotent.
+    state files in the .multiprocessing directory. Safe to invoke repeatedly.
     """
-    state_dir = get_local_state_dir(root_directory_path)
-    pattern = "seekr_anchor_*_state_*.json" if stage_name == "seekr" \
-        else f"{stage_name}_state_*.json"
+    state_dir = get_local_state_dir(root_dir)
+    pattern = f"{stage_name}*state_*.json"
     for state_file in glob.glob(os.path.join(state_dir, pattern)):
+        info_file = state_file.replace("state_", "info_")
         try:
-            state = LocalProcessState.load(state_file)
+            process_info = LocalProcessInfo.load(info_file)
+        except Exception as e:
+            print(f"  Warning: Could not load info file {info_file}: {e}")
+            continue
+        try:
+            process_state = LocalProcessState.load(state_file)
         except Exception as e:
             print(f"  Warning: Could not load state file {state_file}: {e}")
             continue
-        if state.status != "running" or not check_pid_exists(state.pid):
+        if process_state.manager_state not in ["running", "pending"] \
+                or not check_pid_exists(process_info.pid):
             continue
-        pid = state.pid
+        pid = process_info.pid
         print(f"  Killing existing {stage_name} process (PID: {pid})...")
         try:
             os.killpg(pid, signal.SIGTERM)
@@ -675,10 +687,10 @@ def kill_existing_local_stage_processes(
             if check_pid_exists(pid):
                 os.killpg(pid, signal.SIGKILL)
                 time.sleep(1)
-            state.status = "killed"
-            state.ended_at = time.time()
-            state.error = "Process killed for force re-run"
-            state.save(state_file)
+            process_state.manager_state = "cancelled"
+            process_state.ended_at = time.time()
+            process_state.error = "Process killed for force re-run"
+            process_state.save(state_file)
         except (ProcessLookupError, PermissionError) as e:
             print(f"  Warning: Could not kill process: {e}")
     return
@@ -686,7 +698,7 @@ def kill_existing_local_stage_processes(
 def check_and_raise_if_process_failed(
         stage_name: str, 
         stage_process: multiprocessing.Process | None, 
-        root_directory_path: str,
+        root_dir: str,
         anchor: str = "any",
         swarm_id: int | None = None
         ) -> None:
@@ -699,24 +711,26 @@ def check_and_raise_if_process_failed(
         if hasattr(stage_process, 'exitcode') \
                 and stage_process.exitcode is not None \
                 and stage_process.exitcode != 0:
-            state_file = find_latest_state_file(
-                root_directory_path, stage_name, anchor, swarm_id)
-            if state_file:
+            info_file, state_file = find_latest_info_and_state_files(
+                root_dir, stage_name, anchor, swarm_id)
+            if info_file and state_file:
                 try:
-                    state = LocalProcessState.load(state_file)
+                    process_info = LocalProcessInfo.load(info_file)
+                    process_state = LocalProcessState.load(state_file)
                     # Trust the state file: if the child reported success,
                     # ignore a noisy nonzero exit code from interpreter
                     # shutdown (common with fork + asyncio/threads).
-                    if state.status == "completed":
+                    if process_state.stage_state in ["completed"] \
+                            or process_state.manager_state in ["cancelled"]:
                         return
-                    error_text = state.error if state.error is not None \
+                    error_text = process_state.error if process_state.error is not None \
                         else f"process exited with code " \
                              f"{stage_process.exitcode} while state was " \
-                             f"still '{state.status}'"
+                             f"still '{process_state.stage_state}'"
                     error_msg = f"Local {stage_name.upper()} stage failed. "\
                                 f"Error: {error_text}"
-                    if state.traceback:
-                        error_msg += f"\nTraceback:\n{state.traceback}"
+                    if process_state.traceback:
+                        error_msg += f"\nTraceback:\n{process_state.traceback}"
                     raise Exception(error_msg)
                 except json.JSONDecodeError:
                     raise Exception(f"Local {stage_name.upper()} stage failed "\

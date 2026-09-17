@@ -4,6 +4,9 @@ modules/structures.py
 Contain data structure classes used for seekrflow parameters/inputs.
 """
 
+# TODO: clean up this file - it should only contain data structures, not
+#   algorithms or functions
+
 import os
 import json
 import glob
@@ -499,7 +502,6 @@ class Time_policy_adaptive(Time_policy_base):
         default=None,
         validator=validators.optional(validators.instance_of(str)))
 
-
 @define
 class Placement:
     """
@@ -562,107 +564,11 @@ class Resolved_execution:
         default=Factory(Time_policy_adaptive),
         validator=validators.instance_of(Time_policy_base))
 
-
-def time_limit_to_seconds(time_limit: str) -> int:
-    """Parse ``HH:MM:SS`` (optional ``D-`` day prefix) to integer seconds."""
-    time_str = (time_limit or "").strip()
-    if not time_str:
-        raise ValueError("time_limit must be a non-empty HH:MM:SS string")
-    days = 0
-    if "-" in time_str:
-        day_part, time_str = time_str.split("-", 1)
-        days = int(day_part)
-    parts = time_str.split(":")
-    if len(parts) != 3:
-        raise ValueError(
-            f"time_limit must be HH:MM:SS, got {time_limit!r}")
-    hours, minutes, seconds = (int(p) for p in parts)
-    return days * 86400 + hours * 3600 + minutes * 60 + seconds
-
-
-def seconds_to_time_limit(seconds: int) -> str:
-    """Format non-negative seconds as ``HH:MM:SS`` (hours may exceed 24)."""
-    if seconds < 0:
-        raise ValueError(f"seconds must be >= 0, got {seconds}")
-    hours, rem = divmod(int(seconds), 3600)
-    minutes, secs = divmod(rem, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-
-def _resource_compute_defaults(
-        resource: Resource_base | None,
-        ) -> dict:
-    """
-    Backend-native Resource fields → agnostic compute defaults for resolve.
-    """
-    if resource is None:
-        return {
-            "cpus": None,
-            "memory_mb": None,
-            "time_limit": None,
-            "mps": 1,
-        }
-    if isinstance(resource, (Resource_remote_slurm, Resource_remote_pbs)):
-        return {
-            "cpus": resource.cpus_per_task,
-            "memory_mb": resource.memory_per_node,
-            "time_limit": resource.time_limit,
-            "mps": resource.mps,
-        }
-    if isinstance(resource, Resource_cloud_aws):
-        return {
-            "cpus": resource.n_vcpus,
-            "memory_mb": resource.memory_mb,
-            "time_limit": seconds_to_time_limit(resource.job_timeout_seconds),
-            "mps": resource.mps,
-        }
-    return {
-        "cpus": None,
-        "memory_mb": None,
-        "time_limit": None,
-        "mps": 1,
-    }
-
-
 def resource_supports_arrays(resource: Resource_base | None) -> bool:
     return isinstance(
         resource,
         (Resource_remote_slurm, Resource_remote_pbs, Resource_cloud_aws),
     )
-
-
-def _dispatch_uses_array_spread(dispatch: stage_procedures_module.Dispatch) -> bool:
-    return bool(dispatch.dimensions)
-
-
-def _co_schedule_host_name(
-        stage_name: str,
-        co_schedule_with: str,
-        stage_index: int,
-        model_stages: list,
-        stage_names: list[str],
-        ) -> str:
-    stage = model_stages[stage_index]
-    if co_schedule_with == "predecessor":
-        parent_one_based = getattr(stage, "input_stage_index", 0)
-        if parent_one_based <= 0:
-            raise ValueError(
-                f"Stage {stage_name!r} has co_schedule_with='predecessor' "
-                f"but has no predecessor in the model chain.")
-        return model_stages[parent_one_based - 1].name
-    for idx, other in enumerate(model_stages):
-        if getattr(other, "input_stage_index", 0) - 1 == stage_index:
-            return other.name
-    raise ValueError(
-        f"Stage {stage_name!r} has co_schedule_with='successor' "
-        f"but has no successor in the model chain.")
-
-
-def _placement_targets_match(address: list[str], target: list[str]) -> bool:
-    if len(target) > len(address):
-        return False
-    return address[:len(target)] == target
-
 
 def _collect_matching_placements(
         address: list[str],
@@ -706,26 +612,6 @@ def _apply_placement_fields(
         base = accumulator.get(
             "dispatch", stage_procedures_module.Dispatch())
         accumulator["dispatch"] = base.merged_with(placement.dispatch)
-
-
-def _resource_cap_time_limit(resource: Resource_base | None) -> str | None:
-    """Resource walltime cap as HH:MM:SS, or None for local/unknown."""
-    return _resource_compute_defaults(resource).get("time_limit")
-
-
-def _ensure_time_limit_within_cap(
-        label: str,
-        time_limit: str | None,
-        resource_cap: str | None,
-        resource_name: str,
-        ) -> None:
-    if time_limit is None or resource_cap is None:
-        return
-    if time_limit_to_seconds(time_limit) > time_limit_to_seconds(resource_cap):
-        raise ValueError(
-            f"{label} time_limit {time_limit!r} exceeds resource "
-            f"{resource_name!r} cap {resource_cap!r}.")
-
 
 def _resolve_time_policy_fields(
         *,
@@ -856,6 +742,8 @@ class Run_settings:
                 return
         self.placements.append(Placement(target=list(target), resource=resource_name))
 
+    # TODO: see if this could be moved to the client code, possible if that's
+    # the place where this is called - can be converted into a function.
     def resolve_stage_execution(
             self,
             stage_name: str,
@@ -935,159 +823,6 @@ class Run_settings:
         """
         return self.resolve_stage_execution(
             stage_name, procedure).resource
-
-
-def validate_run_settings(
-        seekrflow: "Seekrflow",
-        model: typing.Any | None = None,
-        ) -> None:
-    """
-    Validate placement targets, resource references, and co-scheduling rules.
-    If model is None, it's merely a check placements and resources.
-    """
-    procedure = seekrflow.workflow.procedure
-    address_map = stage_procedures_module.build_stage_address_map(procedure)
-    all_addresses = [path for path, _name in address_map.values()]
-    def _target_is_valid(target: list[str]) -> bool:
-        # Assert that the target procedure/child names in the placements
-        # have valid procedure/children among the stages.
-        return any(
-            _placement_targets_match(address, target)
-            for address in all_addresses)
-
-    seen_targets: set[tuple[str, ...]] = set()
-    for placement in seekrflow.run_settings.placements:
-        target_key = tuple(placement.target)
-        if target_key in seen_targets:
-            raise ValueError(
-                f"Duplicate placement target {list(target_key)!r}.")
-        seen_targets.add(target_key)
-        if len(placement.target) > 0 and not _target_is_valid(placement.target):
-            valid = sorted({tuple(p) for p in all_addresses})
-            raise ValueError(
-                f"Unknown placement target {placement.target!r}. "
-                f"Valid stage address paths include: "
-                f"{[list(p) for p in valid]}.")
-        if placement.resource is not None:
-            resource = seekrflow.run_settings.get_resource_by_name(
-                placement.resource)
-            resource_cap = _resource_cap_time_limit(resource)
-            _ensure_time_limit_within_cap(
-                f"Placement target {placement.target!r}",
-                placement.time_limit,
-                resource_cap,
-                placement.resource,
-            )
-            if isinstance(placement.time_policy, Time_policy_fixed):
-                _ensure_time_limit_within_cap(
-                    f"Time_policy_fixed for target {placement.target!r}",
-                    placement.time_policy.time_limit,
-                    resource_cap,
-                    placement.resource,
-                )
-            elif isinstance(placement.time_policy, Time_policy_adaptive):
-                _ensure_time_limit_within_cap(
-                    f"Time_policy_adaptive.max for target {placement.target!r}",
-                    placement.time_policy.max_time_limit,
-                    resource_cap,
-                    placement.resource,
-                )
-                _ensure_time_limit_within_cap(
-                    f"Time_policy_adaptive.min for target {placement.target!r}",
-                    placement.time_policy.min_time_limit,
-                    resource_cap,
-                    placement.resource,
-                )
-                if placement.time_policy.estimated_performance is not None:
-                    _validate_estimated_performance_scope(
-                        placement, address_map, model)
-
-    if model is None:
-        return
-
-    stage_names = [stage.name for stage in model.stages]
-    for stage_name in stage_names:
-        resolved = seekrflow.run_settings.resolve_stage_execution(
-            stage_name, procedure)
-        if resolved.co_schedule_with is None:
-            continue
-        stage_index = stage_names.index(stage_name)
-        neighbor_name = _co_schedule_host_name(
-            stage_name,
-            resolved.co_schedule_with,
-            stage_index,
-            model.stages,
-            stage_names,
-        )
-        neighbor_resolved = seekrflow.run_settings.resolve_stage_execution(
-            neighbor_name, procedure)
-        if neighbor_resolved.resource_name != resolved.resource_name:
-            raise ValueError(
-                f"Stage {stage_name!r} co_schedule_with "
-                f"{resolved.co_schedule_with!r} requires the same resource "
-                f"as neighbor {neighbor_name!r}, but "
-                f"{resolved.resource_name!r} != "
-                f"{neighbor_resolved.resource_name!r}.")
-        # TODO: this is a problem! We need to be able to chain co-scheduled
-        # stages into each other.
-        #if neighbor_resolved.co_schedule_with is not None:
-        #    #raise ValueError(
-        #    #    f"Stage {neighbor_name!r} cannot host co-scheduled stage "
-        #    #    f"{stage_name!r} because it is itself co-scheduled into "
-        #    #    f"another stage.")
-        #    print("Chaining multiple co-scheduled stages together - I want this to work!")
-        if _dispatch_uses_array_spread(resolved.dispatch):
-            raise ValueError(
-                f"Stage {stage_name!r} cannot be co-scheduled: "
-                f"dispatch.dimensions={resolved.dispatch.dimensions!r} requires "
-                f"array spreading and cannot be fused into a neighbor job.")
-        if _dispatch_uses_array_spread(neighbor_resolved.dispatch):
-            raise ValueError(
-                f"Host stage {neighbor_name!r} cannot co-schedule "
-                f"{stage_name!r}: dispatch.dimensions="
-                f"{neighbor_resolved.dispatch.dimensions!r} requires array "
-                f"spreading.")
-
-
-def _stage_scale_kind_from_model(
-        stage: typing.Any,
-        ) -> str | None:
-    """Return ``\"md\"``, ``\"bd\"``, or None for non-countable scales."""
-    scale_type = getattr(stage, "scale_type", None)
-    if scale_type == "molecular_dynamics":
-        return "md"
-    if scale_type == "brownian_dynamics":
-        return "bd"
-    return None
-
-
-def _validate_estimated_performance_scope(
-        placement: Placement,
-        address_map: dict,
-        model: typing.Any | None,
-        ) -> None:
-    """
-    Refuse estimated_performance when one Placement matches both MD and BD.
-    """
-    if model is None:
-        return
-    kinds: set[str] = set()
-    for stage in model.stages:
-        address_info = address_map.get(stage.name)
-        if address_info is None:
-            continue
-        address, _role = address_info
-        if not _placement_targets_match(address, placement.target):
-            continue
-        kind = _stage_scale_kind_from_model(stage)
-        if kind is not None:
-            kinds.add(kind)
-    if "md" in kinds and "bd" in kinds:
-        raise ValueError(
-            f"Placement target {placement.target!r} sets "
-            f"estimated_performance but matches both MD and BD stages. "
-            f"Narrow the target or omit estimated_performance.")
-
 
 @define
 class Seekrflow:

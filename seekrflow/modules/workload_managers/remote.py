@@ -477,7 +477,7 @@ def cancel_and_reset_remote_stage(
         stage_name: str, # TODO: stage names
         silent: bool = False,
         model_directory: str | None = None,
-        monitor_stage_names: list[str] | None = None, # TODO: remove
+        monitor_stage_names: list[str] | None = None, # TODO: remove in favor of stage-names
         ) -> None:
     """
     Cancel a stage's remote/cloud job and reset its scheduler/runner bookkeeping.
