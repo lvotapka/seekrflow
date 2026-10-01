@@ -5,14 +5,13 @@ Tasks to perform at the start of the client run.
 """
 
 import json
-import typing
+from typing import Optional, List, Dict
 
 import seekr.modules.structures as seekr_structures
 
 import seekrflow.modules.structures as structures
 import seekrflow.modules.client.structures as client_structures
-import seekrflow.modules.workflows.stage_procedures as stage_procedures_module
-
+import seekrflow.modules.transfer.base as transfer_base
 
 def input_is_batch_file(input_json: str) -> bool:
     with open(input_json, "r") as f:
@@ -21,283 +20,200 @@ def input_is_batch_file(input_json: str) -> bool:
         return True
     return False # It's probably a single seekrflow file
 
-def make_session_from_single_seekrflow(
+def make_batch_from_single_seekrflow(
         seekrflow_object: structures.Seekrflow,
-        max_concurrent_local_runs: int = client_structures.DEFAULT_MAX_CONCURRENT_LOCAL_RUNS,
-        background_poll_interval: float = client_structures.DEFAULT_BACKGROUND_POLL_INTERVAL,
-        focused_poll_interval: float = client_structures.DEFAULT_FOCUSED_POLL_INTERVAL,
-        ) -> client_structures.RunSession:
-    session = client_structures.RunSession(
-        seekrflow_objects=[seekrflow_object],
-        batch_directory=None,
-        max_concurrent_local_runs=max_concurrent_local_runs,
-        background_poll_interval=background_poll_interval,
-        focused_poll_interval=focused_poll_interval,
-    )
-    return session
-
-def make_session_from_batch_file(
-        batch_json: str,
         ) -> client_structures.Batch:
-    batch = client_structures.Batch.load_batch_file(batch_json)
-    session = batch.create_session()
-    return session
+    seekrflow_object_dict = seekrflow_object.to_dict()
+    batch_system = client_structures.Batch_system(
+        name=seekrflow_object.name,
+        skip=False,
+        overrides={},
+    )
+    batch = client_structures.Batch(
+        batch_directory=None,
+        template=seekrflow_object_dict,
+        systems=[batch_system],
+        prepare_concurrency=1,
+        max_concurrent_local_runs=client_structures.DEFAULT_MAX_CONCURRENT_LOCAL_RUNS,
+        background_poll_interval=client_structures.DEFAULT_BACKGROUND_POLL_INTERVAL,
+        focused_poll_interval=client_structures.DEFAULT_FOCUSED_POLL_INTERVAL,
+    )
+    batch._existing_seekrflow = seekrflow_object
+    return batch
 
-def _placement_targets_match(address: list[str], target: list[str]) -> bool:
+def _targets_overlap(a: tuple[str, str], b: tuple[str, str]) -> bool:
+    def part(x: str, y: str) -> bool:
+        return x == "*" or y == "*" or x == y
+    return part(a[0], b[0]) and part(a[1], b[1])
+
+def handle_semaphore(
+        model: seekr_structures.Seekr_model,
+        semaphore_dict: Dict[tuple[str, str], str],
+        system_name: str,
+        ) -> Dict[str, str]:
     """
-    Assert that the target procedure/child names in the placements
-    have valid procedure/children among the stages.
+    Handle the semaphore.
     """
-    if len(target) > len(address):
-        return False
-    return address[:len(target)] == target
-
-def time_limit_to_seconds(time_limit: str) -> int:
-    """Parse ``HH:MM:SS`` (optional ``D-`` day prefix) to integer seconds."""
-    time_str = (time_limit or "").strip()
-    if not time_str:
-        raise ValueError("time_limit must be a non-empty HH:MM:SS string")
-    days = 0
-    if "-" in time_str:
-        day_part, time_str = time_str.split("-", 1)
-        days = int(day_part)
-    parts = time_str.split(":")
-    if len(parts) != 3:
-        raise ValueError(
-            f"time_limit must be HH:MM:SS, got {time_limit!r}")
-    hours, minutes, seconds = (int(p) for p in parts)
-    return days * 86400 + hours * 3600 + minutes * 60 + seconds
-
-
-def seconds_to_time_limit(seconds: int) -> str:
-    """Format non-negative seconds as ``HH:MM:SS`` (hours may exceed 24)."""
-    if seconds < 0:
-        raise ValueError(f"seconds must be >= 0, got {seconds}")
-    hours, rem = divmod(int(seconds), 3600)
-    minutes, secs = divmod(rem, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-
-def _resource_compute_defaults(
-        resource: structures.Resource_base | None,
-        ) -> dict:
-    """
-    Backend-native Resource fields → agnostic compute defaults for resolve.
-    """
-    if resource is None:
-        return {
-            "cpus": None,
-            "memory_mb": None,
-            "time_limit": None,
-            "mps": 1,
-        }
-    if isinstance(resource, (structures.Resource_remote_slurm, 
-                             structures.Resource_remote_pbs)):
-        return {
-            "cpus": resource.cpus_per_task,
-            "memory_mb": resource.memory_per_node,
-            "time_limit": resource.time_limit,
-            "mps": resource.mps,
-        }
-    if isinstance(resource, structures.Resource_cloud_aws):
-        return {
-            "cpus": resource.n_vcpus,
-            "memory_mb": resource.memory_mb,
-            "time_limit": seconds_to_time_limit(resource.job_timeout_seconds),
-            "mps": resource.mps,
-        }
-    return {
-        "cpus": None,
-        "memory_mb": None,
-        "time_limit": None,
-        "mps": 1,
-    }
-
-def _resource_cap_time_limit(resource: structures.Resource_base | None) -> str | None:
-    """
-    Resource walltime cap as HH:MM:SS, or None for local/unknown.
-    """
-    return _resource_compute_defaults(resource).get("time_limit")
-
-def _ensure_time_limit_within_cap(
-        label: str,
-        time_limit: str | None,
-        resource_cap: str | None,
-        resource_name: str,
-        ) -> None:
-    if time_limit is None or resource_cap is None:
-        return
-    if time_limit_to_seconds(time_limit) > time_limit_to_seconds(resource_cap):
-        raise ValueError(
-            f"{label} time_limit {time_limit!r} exceeds resource "
-            f"{resource_name!r} cap {resource_cap!r}.")
-
-def _stage_scale_kind_from_model(
-        stage: typing.Any,
+    all_stage_names = [s.name for s in model.stages]
+    this_system_semaphore_dict = {}
+    for (sys, stage), value in semaphore_dict.items():
+        if value not in ["go", "wait", "stop"]:
+            raise ValueError(
+                f"Invalid semaphore value: {value}. Must be go, wait, or stop")
+        if sys == "*" or sys == system_name:
+            if stage == "*":
+                for name in all_stage_names:
+                    this_system_semaphore_dict[name] = value
+            else:
+                if stage not in all_stage_names:
+                    raise ValueError(
+                        f"Unknown stage {stage!r} in --semaphore for {system_name!r}. "
+                        f"Available: {all_stage_names}")
+                this_system_semaphore_dict[(stage)] = value
+    
+    return this_system_semaphore_dict
+            
+def handle_benchmark_stage(
+        model: seekr_structures.Seekr_model,
+        benchmark_target: tuple[str, str],
+        this_system_semaphore_dict: Dict[str, str],
+        system_name: str,
         ) -> str | None:
     """
-    Return md, bd, or None for non-countable scales.
+    Handle the benchmark stage.
     """
-    scale_type = getattr(stage, "scale_type", None)
-    if scale_type == "molecular_dynamics":
-        return "md"
-    if scale_type == "brownian_dynamics":
-        return "bd"
-    return None
-
-def _validate_estimated_performance_scope(
-        placement: structures.Placement,
-        address_map: dict,
-        model: seekr_structures.Seekr_model | None,
-        ) -> None:
-    """
-    Refuse estimated_performance when one Placement matches both MD and BD.
-    """
-    if model is None:
-        return
-    kinds: set[str] = set()
-    for stage in model.stages:
-        address_info = address_map.get(stage.name)
-        if address_info is None:
-            continue
-        address, _role = address_info
-        if not _placement_targets_match(address, placement.target):
-            continue
-        kind = _stage_scale_kind_from_model(stage)
-        if kind is not None:
-            kinds.add(kind)
-    if "md" in kinds and "bd" in kinds:
+    system, stage = benchmark_target
+    if not (system == "*" or system == system_name):
+        return None
+    if stage == "*":
         raise ValueError(
-            f"Placement target {placement.target!r} sets "
-            f"estimated_performance but matches both MD and BD stages. "
-            f"Narrow the target or omit estimated_performance.")
+            f"Cannot benchmark all stages; pass one STAGE or SYSTEM:STAGE.")
+    if this_system_semaphore_dict.get(stage) == "stop":
+        raise ValueError(
+            f"Conflicting options: --benchmark {system}:{stage} and "
+            f"--semaphore {system}:{stage}:stop. "
+            "Cannot benchmark a stopped stage.")    
+    all_stage_names = [s.name for s in model.stages]
+    if stage not in all_stage_names:
+        raise ValueError(
+            f"Unknown benchmark_stage {stage!r}. "
+            f"Available stages: {all_stage_names}")
+    # TODO: more here? Old seekr_run.py check for DAG cycles (not necessary)
+    #  Also, old seekr_run.py checked if ancestors finished (also not necessary)
+    #  I would rather run all stages up to the benchmarked stage as well as the
+    #  benchmarked stage itself.
+    #  I think that if someone wanted to run a strict benchmark, they would 
+    #  accomplish this with two successive runs using semaphores.
+    return stage
 
-def _co_schedule_host_name(
-        stage_name: str,
-        co_schedule_with: str,
-        stage_index: int,
-        model_stages: list,
-        stage_names: list[str],
-        ) -> str:
+def handle_force_rerun(
+        model: seekr_structures.Seekr_model,
+        force_targets: Optional[List[tuple[str, str]]],
+        this_system_semaphore_dict: Dict[str, str],
+        system_name: str,
+        ) -> List:
     """
-    Determine the name of the stage that a given stage is co-scheduled with.
+    Handle the force rerun stage.
     """
-    stage = model_stages[stage_index]
-    if co_schedule_with == "predecessor":
-        parent_one_based = getattr(stage, "input_stage_index", 0)
-        if parent_one_based <= 0:
-            raise ValueError(
-                f"Stage {stage_name!r} has co_schedule_with='predecessor' "
-                f"but has no predecessor in the model chain.")
-        return model_stages[parent_one_based - 1].name
-    for idx, other in enumerate(model_stages):
-        if getattr(other, "input_stage_index", 0) - 1 == stage_index:
-            return other.name
-    raise ValueError(
-        f"Stage {stage_name!r} has co_schedule_with='successor' "
-        f"but has no successor in the model chain.")
+    
+    all_stage_names = [s.name for s in model.stages]
+    if force_targets is None:
+        force_rerun_stages: set[str] = set()
+    elif len(force_targets) == 0:
+        force_rerun_stages = set(all_stage_names)
+    else:
+        #unknown = [s for s in force_targets if s not in all_stage_names]
+        #if unknown:
+        #    raise ValueError(
+        #        f"Unknown stage(s) in force_targets: {unknown}. "
+        #        f"Available stages: {all_stage_names}")
+        force_rerun_stages: set[str] = set()
+        for fsys, fstage in force_targets:
+            if not (fsys == system_name or fsys == "*"):
+                continue
+            if fstage == "*":
+                force_rerun_stages.update(all_stage_names)
+            elif fstage not in all_stage_names:
+                raise ValueError(
+                    f"Unknown stage {fstage!r} in --force_rerun for {system_name!r}. "
+                    f"Available: {all_stage_names}")
+            else:
+                force_rerun_stages.add(fstage)
 
-def _dispatch_uses_array_spread(dispatch: stage_procedures_module.Dispatch) -> bool:
-    return bool(dispatch.dimensions)
+    if force_targets is not None:
+        if len(force_targets) == 0:
+            force_targets = [("*", "*")]
+        for fsys, fstage in force_targets:
+            for sstage, value in this_system_semaphore_dict.items():
+                if value != "stop":
+                    continue
+                if _targets_overlap((fsys, fstage), (system_name, sstage)):
+                    raise ValueError(f"Conflicting options: --force_rerun {fsys}:{fstage} and "
+                                     f"--semaphore {system_name}:{sstage}:stop.")
+    if force_rerun_stages:
+        print(f"Force-rerun requested for stages: "
+              f"{sorted(force_rerun_stages)}")
+    return sorted(force_rerun_stages)
 
-# TODO: revamp this
-def validate_run_settings(
+def handle_transfer(
+        model: seekr_structures.Seekr_model,
+        transfer_targets: Optional[List[tuple[str, str]]],
+        system_name: str,
+        ) -> List[str]:
+    """
+    Handle the transfer stage.
+    """
+    
+    all_stage_names = [s.name for s in model.stages]
+    if transfer_targets is None:
+        transfer_stages: set[str] = set()
+    elif len(transfer_targets) == 0:
+        transfer_stages = set(all_stage_names)
+    else:
+        transfer_stages: set[str] = set()
+        for fsys, fstage in transfer_targets:
+            if not (fsys == system_name or fsys == "*"):
+                continue
+            if fstage == "*":
+                transfer_stages.update(all_stage_names)
+            elif fstage not in all_stage_names:
+                raise ValueError(
+                    f"Unknown stage {fstage!r} in --force_rerun for {system_name!r}. "
+                    f"Available: {all_stage_names}")
+            else:
+                transfer_stages.add(fstage)
+
+    if transfer_stages:
+        print(f"Transfer requested for stages: "
+              f"{sorted(transfer_stages)}")
+    return sorted(transfer_stages)
+
+def transfer_unique_stage_resources(
         seekrflow: structures.Seekrflow,
-        model: seekr_structures.Seekr_model | None = None,
-        ) -> None:
+        stage_names: list[str],
+        backwards: bool
+        ) -> list[str]:
     """
-    Validate placement targets, resource references, and co-scheduling rules.
-    If model is None, it's merely a check placements and resources.
+    Transfer the stage resources to its remote resource.
     """
-    procedure = seekrflow.workflow.procedure
-    address_map = stage_procedures_module.build_stage_address_map(procedure)
-    all_addresses = [path for path, _name in address_map.values()]
-    def _target_is_valid(target: list[str]) -> bool:
-        return any(
-            _placement_targets_match(address, target)
-            for address in all_addresses)
-
-    seen_targets: set[tuple[str, ...]] = set()
-    for placement in seekrflow.run_settings.placements:
-        target_key = tuple(placement.target)
-        if target_key in seen_targets:
-            raise ValueError(
-                f"Duplicate placement target {list(target_key)!r}.")
-        seen_targets.add(target_key)
-        if len(placement.target) > 0 and not _target_is_valid(placement.target):
-            valid = sorted({tuple(p) for p in all_addresses})
-            raise ValueError(
-                f"Unknown placement target {placement.target!r}. "
-                f"Valid stage address paths include: "
-                f"{[list(p) for p in valid]}.")
-        if placement.resource is not None:
-            resource = seekrflow.run_settings.get_resource_by_name(
-                placement.resource)
-            resource_cap = _resource_cap_time_limit(resource)
-            _ensure_time_limit_within_cap(
-                f"Placement target {placement.target!r}",
-                placement.time_limit,
-                resource_cap,
-                placement.resource,
-            )
-            if isinstance(placement.time_policy, structures.Time_policy_fixed):
-                _ensure_time_limit_within_cap(
-                    f"Time_policy_fixed for target {placement.target!r}",
-                    placement.time_policy.time_limit,
-                    resource_cap,
-                    placement.resource,
-                )
-            elif isinstance(placement.time_policy, structures.Time_policy_adaptive):
-                _ensure_time_limit_within_cap(
-                    f"Time_policy_adaptive.max for target {placement.target!r}",
-                    placement.time_policy.max_time_limit,
-                    resource_cap,
-                    placement.resource,
-                )
-                _ensure_time_limit_within_cap(
-                    f"Time_policy_adaptive.min for target {placement.target!r}",
-                    placement.time_policy.min_time_limit,
-                    resource_cap,
-                    placement.resource,
-                )
-                if placement.time_policy.estimated_performance is not None:
-                    _validate_estimated_performance_scope(
-                        placement, address_map, model)
-
-    if model is None:
-        return
-
-    stage_names = [stage.name for stage in model.stages]
+    root_directory = str(seekrflow.get_root_directory())
+    resources_by_name: dict[str, structures.Resource_remote_base] = {}
     for stage_name in stage_names:
-        resolved = seekrflow.run_settings.resolve_stage_execution(
-            stage_name, procedure)
-        if resolved.co_schedule_with is None:
+        try:
+            resource = seekrflow.run_settings.get_stage_resource(
+                stage_name, seekrflow.workflow.procedure)
+        except ValueError:
+            resource = None
+        if resource is None:
             continue
-        stage_index = stage_names.index(stage_name)
-        neighbor_name = _co_schedule_host_name(
-            stage_name,
-            resolved.co_schedule_with,
-            stage_index,
-            model.stages,
-            stage_names,
+        resources_by_name[resource.name] = resource
+
+    # TODO: check if the remote resource already has the files?
+    for resource in resources_by_name.values():
+        transfer_base.transfer_files_to_from_remote_resource(
+            seekrflow.name,
+            resource,
+            root_directory,
+            backwards=backwards,
         )
-        neighbor_resolved = seekrflow.run_settings.resolve_stage_execution(
-            neighbor_name, procedure)
-        if neighbor_resolved.resource_name != resolved.resource_name:
-            raise ValueError(
-                f"Stage {stage_name!r} co_schedule_with "
-                f"{resolved.co_schedule_with!r} requires the same resource "
-                f"as neighbor {neighbor_name!r}, but "
-                f"{resolved.resource_name!r} != "
-                f"{neighbor_resolved.resource_name!r}.")
-        if _dispatch_uses_array_spread(resolved.dispatch):
-            raise ValueError(
-                f"Stage {stage_name!r} cannot be co-scheduled: "
-                f"dispatch.dimensions={resolved.dispatch.dimensions!r} requires "
-                f"array spreading and cannot be fused into a neighbor job.")
-        if _dispatch_uses_array_spread(neighbor_resolved.dispatch):
-            raise ValueError(
-                f"Host stage {neighbor_name!r} cannot co-schedule "
-                f"{stage_name!r}: dispatch.dimensions="
-                f"{neighbor_resolved.dispatch.dimensions!r} requires array "
-                f"spreading.")
+    return list(resources_by_name.keys())

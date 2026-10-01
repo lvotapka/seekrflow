@@ -8,27 +8,112 @@ direct the workflows.
 """
 
 import os
+import asyncio
 import argparse
 from typing import List, Dict
+
+import seekr.modules.structures as seekr_structures
 
 import seekrflow.modules.structures as structures
 import seekrflow.modules.client.structures as client_structures
 import seekrflow.modules.client.start as client_start
+import seekrflow.modules.client.validation as client_validation
+import seekrflow.modules.client.run as client_run
 
 def client(
-        session: client_structures.RunSession,
-        output_json: str,
-        transfer_from_remote_only: str,
-        force_rerun: List[str],
-        benchmark: str,
-        semaphore_dict: Dict[str, str]) -> None:
-    print("mark10")
-    for seekrflow in session.seekrflow_objects:
-        client_start.validate_run_settings(seekrflow)
+        batch: client_structures.Batch,
+        instruction: str,
+        output_file: str,
+        control_file: str,
+        transfer_targets: List[tuple[str, str]] | None,
+        force_targets: List[tuple[str, str]] | None,
+        benchmark_target: tuple[str, str] | None,
+        semaphore_dict: Dict[tuple[str, str], str] | None,
+        ) -> None:
+    """
+    Orchestrate a batch of seekrflow workflows.
+    """
+    curdir = os.getcwd()
+    if batch.batch_directory is not None:
+        os.chdir(batch.batch_directory)
+    session = batch.create_session(output_file, control_file)
+    for systemrun in session.systemrun_objects:
+        seekrflow, model = systemrun.seekrflow, systemrun.model
+        client_validation.validate_run_settings(seekrflow, model)
+        this_system_semaphore_dict = {}
+        if semaphore_dict is not None:
+            this_system_semaphore_dict = client_start.handle_semaphore(
+                model, semaphore_dict, seekrflow.name)
+            systemrun.semaphore_dict = this_system_semaphore_dict
+        if benchmark_target is not None:
+            benchmark_stage = client_start.handle_benchmark_stage(
+                model, benchmark_target, this_system_semaphore_dict,seekrflow.name)
+            systemrun.benchmark_stage = benchmark_stage
+        if force_targets is not None:
+            force_rerun_stages_this_system = client_start.handle_force_rerun(
+                model, force_targets, this_system_semaphore_dict, seekrflow.name)
+            systemrun.force_rerun_stages = force_rerun_stages_this_system
+
+        all_stage_names = [s.name for s in model.stages]
+        if transfer_targets is not None:
+            transfer_stages_this_system= client_start.handle_transfer(
+                model, transfer_targets, seekrflow.name)
+            transferred_resources = client_start.transfer_unique_stage_resources(
+                seekrflow, transfer_stages_this_system, backwards=True)
+            continue
+        
+    if transfer_targets is not None:
+        return
+
+    if instruction == "run":
+        asyncio.run(client_run.launch_session_pipelines(session))
+        perform_final_transfer = True
+    #elif instruction == "status": # TODO: implement
+    #    client_run.get_session_status(session)
+    #    perform_final_transfer = False
+    #elif instruction == "stop": # TODO: implement
+    #    client_run.stop_session_pipelines(session)
+    #    perform_final_transfer = False
+    # TODO: add a "none" instruction? Or "transfer"?
+    else:
+        raise ValueError(f"Unknown instruction: {instruction!r}")
+    
+    if perform_final_transfer:
+        for systemrun in session.systemrun_objects:
+            transfer_stages_this_system = all_stage_names
+            transferred_resources = client_start.transfer_unique_stage_resources(
+                seekrflow, transfer_stages_this_system, backwards=True)
+            continue
+    
+    os.chdir(curdir)
+    return
+
+def parse_semaphore_token(token: str) -> tuple[str, str, str]:
+    parts = token.split(":")
+    if len(parts) == 2:
+        stage, value = parts
+        return "*", stage, value
+    if len(parts) == 3:
+        system, stage, value = parts
+        return system, stage, value
+    raise ValueError(f"Invalid --semaphore token: {token!r}")
+
+def parse_force_benchmark_transfer_token(token: str) -> tuple[str, str]:
+    parts = token.split(":")
+    if len(parts) == 1:
+        return "*", parts[0]          # stage only
+    if len(parts) == 2:
+        return parts[0], parts[1]     # system, stage
+    raise ValueError(f"Invalid --force_rerun or --benchmark token: {token!r}")
 
 def main():
     parser = argparse.ArgumentParser(
         description="Run a single or batch of seekrflow workflows")
+    parser.add_argument(
+        "instruction", metavar="INSTRUCTION", type=str,
+        help="The instruction for client. Options include 'run', which will "
+        "run the workflow normally, 'status' will produce a quick status report "
+        "and then exit, 'stop' will stop any detached jobs and exit.")
     parser.add_argument(
         "-i", "--input-json", dest="input_json", metavar="INPUT_JSON",
         help="Input JSON file containing the job specification")
@@ -46,82 +131,93 @@ def main():
         "useful in hotshot mode to give a more informative name to the run - "
         "otherwise, it will be named 'hotshot_<inode>_<device>'.")
     parser.add_argument(
-        "-o", "--output-json", dest="output_json", metavar="OUTPUT_JSON",
+        "-o", "--output-file", dest="output_file", metavar="OUTPUT_FILE",
+        type=str, default="", required=True,
         help="Output JSON file containing internal states of jobs")
     parser.add_argument(
-        "-T", "--transfer-from-remote-only", dest="transfer_from_remote_only", 
-        metavar="STAGE", type=str, default=None,
-        help="Pull files from remote for STAGE (or 'all') to the local system"
-        "without starting monitors or submitting jobs. Stop a live batch "
-        "run first if a child still owns the work directory.")
+        "-c", "--control-file", dest="control_file", metavar="CONTROL_FILE",
+        type=str, default="", required=True,
+        help="Control JSON file that can change semaphore states, force transfers "\
+            "detach jobs, and other control actions.")
     parser.add_argument(
-        "-f", "--force_rerun", dest="force_rerun", metavar="STAGE",
+        "-T", "--transfer-from-remote-only", dest="transfer_from_remote_only", 
+        metavar="SPEC", type=str, nargs="*", default=None,
+        help="Pull files from remote for the given system/stage targets. Each SPEC is "
+        "'SYSTEM:STAGE' (use '*' for all systems or all stages). "
+        "Examples: -T lig1:mmvt  |  -T *:mmvt  |  -T lig1:*  |  -T lig1:mmvt lig2:mmvt lig3:*"
+        "This argument will cause nothing to happen after the transfers - the "
+        "client will simply exit.")
+    parser.add_argument(
+        "-f", "--force_rerun", dest="force_rerun", metavar="SPEC",
         type=str, nargs="*", default=None,
-        help="If set, force re-run of stages. Provide a space-separated list "
-        "of stage names (e.g. -f bd mmvt) to force-rerun only those stages, "
-        "or pass -f with no arguments to force-rerun all stages. Any running "
-        "processes for the affected stages will be killed and the stages "
-        "restarted with force_overwrite=True.")
+        help="Force-rerun the given system/stage targets. Each SPEC is "
+        "'STAGE' (that stage on every system) or 'SYSTEM:STAGE'. "
+        "Use '*' for all systems or all stages (e.g. lig1:* or *:mmvt). "
+        "Pass -f with no SPEC to force-rerun everything. "
+        "Examples: -f mmvt  |  -f lig1:bd lig2:mmvt  |  -f")
     parser.add_argument(
         "-b", "--benchmark", dest="benchmark",
-        metavar="STAGE", type=str, default=None,
-        help="If set, run the named stage in benchmark mode - a quick run on "
-        "the resource to get approximate timings. At most, a single "
-        "stage can be benchmarked per invocation, since dependent stages "
-        "would not produce the outputs needed downstream. Default: None.")
+        metavar="SPEC", type=str, default=None,
+        help="Run one stage in benchmark mode (short timing run). "
+        "SPEC is 'STAGE' or 'SYSTEM:STAGE'. Only one benchmark per "
+        "invocation. Example: -b mmvt  |  -b lig1:mmvt")
     parser.add_argument(
-        "--semaphore", dest="semaphore",
-        metavar="STAGE_CONTROL", type=str, default=None,
-        help="Control stage execution. Format: 'stage:value,stage:value,...' "
-        "where stage is any configured stage name and value is go/wait/stop. "
-        "go: normal operation (default), wait: don't submit new jobs but let "
-        "running jobs finish, stop: don't submit new jobs AND kill any running "
-        "jobs. Example: --semaphore stage1:stop,stage2:wait.")
+        "--semaphore", dest="semaphore", metavar="SPEC",
+        type=str, nargs="*", default=None,
+        help="Set go/wait/stop for system/stage pairs. Each SPEC is "
+        "'STAGE:VALUE' (every system) or 'SYSTEM:STAGE:VALUE'. "
+        "VALUE is go (default), wait (no new submits), or stop "
+        "(no new submits and kill running work). '*' means all "
+        "systems or all stages. "
+        "Examples: --semaphore mmvt:stop  |  "
+        "--semaphore lig1:mmvt:stop lig2:*:wait")
     #parser.add_argument(
     #    "-O", "--output-socket", dest="output_socket", metavar="OUTPUT_SOCKET",
     #    help="Output socket number for internal state updates"
     #)
     args = vars(parser.parse_args())
+    instruction = args.get("instruction")
     input_json = args.get("input_json")
     model_filename = args.get("model_filename")
     name = args.get("name")
-    output_json = args.get("output_json")
+    output_file = args.get("output_file")
+    control_file = args.get("control_file")
     transfer_from_remote_only = args.get("transfer_from_remote_only")
     force_rerun = args.get("force_rerun")
     benchmark = args.get("benchmark")
 
+    # TODO: implement 'status' instruction to produce quick status reports for
+    #  display before launch
+
     semaphore_dict = {}
     if args["semaphore"]:
-        for item in args["semaphore"].split(","):
-            parts = item.strip().split(":")
-            if len(parts) != 2:
-                raise ValueError(
-                    f"Invalid semaphore format: {item}. Expected 'stage:value'")
-            stage, value = parts[0].strip(), parts[1].strip()
-            if value not in ["go", "wait", "stop"]:
-                raise ValueError(
-                    f"Invalid semaphore value: {value}. Must be go, wait, or stop")
-            semaphore_dict[stage] = value
-
-    if force_rerun is not None:
-        stages_to_check = force_rerun if force_rerun \
-            else list(semaphore_dict.keys())
-        for stage in stages_to_check:
-            if semaphore_dict.get(stage) == "stop":
-                raise ValueError(
-                    f"Conflicting options: --force-rerun {stage} and "
-                    f"--semaphore {stage}:stop. "
-                    "Cannot force rerun a stopped stage.")
-
+        for item in args["semaphore"]:
+            system, stage, value = parse_semaphore_token(item)
+            # TODO: move this check into the client code
+            #if value not in ["go", "wait", "stop"]:
+            #    raise ValueError(
+            #        f"Invalid semaphore value: {value}. Must be go, wait, or stop")
+            semaphore_dict[(system, stage)] = value
+    
+    benchmark_target = None
     if benchmark is not None:
-        stages_to_check = benchmark if benchmark \
-            else list(semaphore_dict.keys())
-        for stage in stages_to_check:
-            if semaphore_dict.get(stage) == "stop":
-                raise ValueError(
-                    f"Conflicting options: --benchmark {stage} and "
-                    f"--semaphore {stage}:stop. "
-                    "Cannot benchmark a stopped stage.")
+        benchmark_target = parse_force_benchmark_transfer_token(benchmark)
+
+    force_targets = None
+    if force_rerun is not None:
+        if not force_rerun:
+            force_targets = [("*", "*")]
+        else:
+            force_targets = [parse_force_benchmark_transfer_token(t) \
+                for t in force_rerun]
+
+    transfer_targets = None
+    if transfer_from_remote_only is not None:
+        if not transfer_from_remote_only:
+            transfer_targets = [("*", "*")]
+        else:
+            transfer_targets = [parse_force_benchmark_transfer_token(t) \
+                for t in transfer_from_remote_only]
 
     hotshot_mode = False
     if input_json == "":
@@ -144,7 +240,7 @@ def main():
         seekrflow.root_directory = os.path.dirname(
             os.path.abspath(model_filename))
         structures.try_to_load_resources_json(seekrflow)
-        session = client_start.make_session_from_single_seekrflow(seekrflow)
+        batch = client_start.make_batch_from_single_seekrflow(seekrflow)
 
     else:
         assert model_filename == "", \
@@ -155,7 +251,8 @@ def main():
         # TODO: load either the seekrflow JSON or the batch JSON
 
         if client_start.input_is_batch_file(input_json):
-            session = client_start.make_session_from_batch_file(input_json)
+            #session = client_start.make_session_from_batch_file(input_json)
+            batch = client_structures.Batch.load_batch_file(input_json)
         else:
             seekrflow = structures.load_seekrflow(input_json)
             if name != "":
@@ -163,10 +260,10 @@ def main():
             work_dir = os.path.abspath(
                 os.path.expanduser(seekrflow.work_directory))
             seekrflow.make_work_directory(work_dir)
-            session = client_start.make_session_from_single_seekrflow(seekrflow)
-        
-    client(session, output_json,transfer_from_remote_only, force_rerun, 
-           benchmark, semaphore_dict)
+            batch = client_start.make_batch_from_single_seekrflow(seekrflow)
+    
+    client(batch, instruction, output_file, control_file, transfer_targets, 
+           force_targets, benchmark_target, semaphore_dict)
 
 if __name__ == "__main__":
     main()

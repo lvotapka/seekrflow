@@ -8,13 +8,16 @@ import typing
 import fabric
 from io import StringIO
 
-import seekrflow.modules.remote_interfaces.python_c_runner as python_c_runner
+import seekrflow.modules.remote_interfaces.base as remote_interface_base
 
+# Timeout for a SSH promise future. On expiry, raise TimeoutError
+# so callers can retry on the next poll without treating it as a hard failure.
+SSH_RESULT_TIMEOUT_S = 120.0
 
-def submit_remote_workflow_with_ssh(
-        name: str,
-        workflow: typing.Any,
-        args: tuple,
+def submit_remote_workload_with_ssh(
+        resource_name: str,
+        workload: typing.Any,
+        manager_payload: dict,
         hostname: str,
         username: str = "",
         password: str = "",
@@ -22,6 +25,9 @@ def submit_remote_workflow_with_ssh(
         private_key_filename: str | None = None,
         private_key_passphrase: str | None = None,
         ) -> dict:
+    # TODO: convert manager_payload to args
+    args = [manager_payload]
+
     connect_kwargs = {}
     if password:
         connect_kwargs["password"] = password
@@ -35,7 +41,7 @@ def submit_remote_workflow_with_ssh(
         port=port,
         connect_kwargs=connect_kwargs,
     )
-    cmd = python_c_runner.build_python_c_command(workflow, args)
+    cmd = remote_interface_base.build_python_c_command(workload, args)
     # Buffers where Fabric’s I/O threads will write output in real-time
     out_buf, err_buf = StringIO(), StringIO()
 
@@ -53,7 +59,7 @@ def submit_remote_workflow_with_ssh(
 
     try:
         # Process finished — grab the final Result (exit code, full buffers, etc.)
-        promise.join()
+        promise.join(timeout=SSH_RESULT_TIMEOUT_S)
         so = out_buf.getvalue()
         if len(so) > seen_out:
             seen_out = len(so)
@@ -62,7 +68,7 @@ def submit_remote_workflow_with_ssh(
         if len(se) > seen_err:
             seen_err = len(se)
 
-        val = python_c_runner.parse_workflow_stdout(
+        val = remote_interface_base.parse_workflow_stdout(
             so, se, transport_label="SSH")
         c.close()
         return val

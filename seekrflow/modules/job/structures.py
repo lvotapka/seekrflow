@@ -9,6 +9,7 @@ Define the structures for the job.py script, including:
 - TelemetryState
 """
 
+import os
 import time
 import json
 import pathlib
@@ -40,9 +41,11 @@ class StageInfo:
             self.filename = str(path_basename)
         # Creates root_dir/.stage_states; fails if root_dir is missing
         path.parent.mkdir(exist_ok=True)
-        with open(path, "w") as f:
+        path_tmp = path.with_suffix(".tmp")
+        with open(path_tmp, "w") as f:
             json.dump(asdict(self), f, indent=2)
-
+        os.rename(path_tmp, path)
+        
     @staticmethod
     def load(path: pathlib.Path) -> "StageInfo":
         with open(path, "r") as f:
@@ -53,7 +56,8 @@ class StageState:
     internal_id: int
     state: str = "unstarted" #'unstarted', 'started', 'completed', 'error', 'unknown'
     finished: bool = False
-    stage_anchor_swarm_progress_dict: Optional[Dict[Tuple[int, int | str, int | None], float]] = None
+    stage_anchor_swarm_progress_list: Optional[List[Tuple[int, int | str, int | None, float]]] = None
+    status_info: Optional[dict] = None
     notes: Optional[str] = None
     filename: Optional[str] = None
     stage_info_filename: Optional[str] = None
@@ -74,9 +78,11 @@ class StageState:
             self.filename = str(path_basename)
         # Creates root_dir/.stage_states; fails if root_dir is missing
         path.parent.mkdir(exist_ok=True)
+        path_tmp = path.with_suffix(".tmp")
         self.latest_timestamp = time.time()
-        with open(path, "w") as f:
+        with open(path_tmp, "w") as f:
             json.dump(asdict(self), f, indent=2)
+        os.rename(path_tmp, path)
 
     @staticmethod
     def load(path: pathlib.Path) -> "StageState":
@@ -115,8 +121,11 @@ class StageSpec:
 
     def save(self, path) -> None:
         path = pathlib.Path(path)
-        with open(path, "w") as f:
+        path_tmp = path.with_suffix(".tmp")
+        with open(path_tmp, "w") as f:
             json.dump(self.to_dict(), f, indent=2)
+        os.rename(path_tmp, path)
+
     @classmethod
     def load(cls, path) -> "JobSpec":
         with open(path) as f:
@@ -124,7 +133,6 @@ class StageSpec:
 
 @dataclass
 class JobSpec:
-    schema_version: str
     internal_id: int
     remote_root_dir: str
     status_write_interval: float
@@ -133,6 +141,7 @@ class JobSpec:
     run_units: List[RunUnit]
     concurrency: int # number of run units to launch in parallel
     array_index: int # index of this run unit in the group
+    schema_version: str = "1.0.0"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -143,8 +152,11 @@ class JobSpec:
         return cls(**{**data, "stages": stages})
     def save(self, path) -> None:
         path = pathlib.Path(path)
-        with open(path, "w") as f:
+        path_tmp = path.with_suffix(".tmp")
+        with open(path_tmp, "w") as f:
             json.dump(self.to_dict(), f, indent=2)
+        os.rename(path_tmp, path)
+        
     @classmethod
     def load(cls, path) -> "JobSpec":
         with open(path) as f:

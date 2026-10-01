@@ -10,24 +10,22 @@ from __future__ import annotations
 import subprocess
 import typing
 
-import seekrflow.modules.remote_interfaces.python_c_runner as python_c_runner
-
+import seekrflow.modules.remote_interfaces.base as remote_interface_base
 
 def submit_remote_workflow_with_local_shell(
-        name: str,
+        resource_name: str,
         workflow: typing.Any,
-        args: list | tuple,
+        manager_payload: dict,
         python_executable: str = "python3",
         silent: bool = False,
         ) -> dict:
     """
-    Run ``workflow`` locally with the same serialization/parse path as SSH.
-
-    ``name`` is accepted for API parity with other remote interfaces; it is
-    unused except for optional diagnostics.
+    Run 'workflow' locally with the same serialization/parse path as SSH.
     """
+    # TODO: convert manager_payload to args
+    args = [manager_payload]
     del silent  # reserved for future quiet logging parity with Globus
-    cmd = python_c_runner.build_python_c_command(
+    cmd = remote_interface_base.build_python_c_command(
         workflow, args, python_executable=python_executable)
     completed = subprocess.run(
         cmd,
@@ -41,9 +39,9 @@ def submit_remote_workflow_with_local_shell(
         stderr_tail = "\n".join(stderr.splitlines()[-10:])
         stdout_tail = "\n".join(stdout.splitlines()[-10:])
         raise RuntimeError(
-            f"Local shell workflow {name!r} exited with code "
+            f"Local shell workflow {resource_name!r} exited with code "
             f"{completed.returncode}. stdout_tail={stdout_tail!r}. "
             f"stderr_tail={stderr_tail!r}"
         )
-    return python_c_runner.parse_workflow_stdout(
+    return remote_interface_base.parse_workflow_stdout(
         stdout, stderr, transport_label="local_shell")

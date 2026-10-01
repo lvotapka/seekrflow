@@ -12,10 +12,11 @@ import os
 import json
 import copy
 import typing
-from typing import List
+from typing import List, Dict
 
 from attrs import define, field, validators
 import cattrs
+import seekr.modules.structures as seekr_structures
 
 import seekrflow.modules.structures as structures
 Seekrflow = structures.Seekrflow
@@ -25,12 +26,12 @@ DEFAULT_FOCUSED_POLL_INTERVAL = 5.0
 DEFAULT_MAX_CONCURRENT_LOCAL_RUNS = 1
 SEEKRFLOW_JSON_NAME = "seekrflow.json"
 
-@define
-class StagePlan:
-    """
-    A plan for a single stage: names, dependencies, resource, force, benchmark.
-    """
-    ...
+#@define
+#class StagePlan:
+#    """
+#    A plan for a single stage: names, dependencies, resource, force, benchmark.
+#    """
+#    ...
 
 @define
 class SystemRun:
@@ -39,10 +40,16 @@ class SystemRun:
     """
     name: str = field(validator=validators.instance_of(str))
     seekrflow: Seekrflow = field(validator=validators.instance_of(Seekrflow))
-    stage_plans: List[StagePlan] = field(
-        default=list(),
-        validator=validators.instance_of(list),
-    )
+    model: seekr_structures.Seekr_model = field(validator=validators.instance_of(seekr_structures.Seekr_model))
+    semaphore_dict: Dict[str, str] = field(validator=validators.instance_of(dict))
+    force_rerun_stages: List[str] = field(validator=validators.instance_of(list))
+    benchmark_stage: str | None = field(validator=validators.optional(validators.instance_of(str))) # TODO: move to stage plan?
+    #transferred_resources: List[str] = field(validator=validators.instance_of(list))
+    #perform_final_transfer: bool = field(validator=validators.instance_of(bool))
+    #stage_plans: List[StagePlan] = field(
+    #    factory=list,
+    #    validator=validators.instance_of(list),
+    #)
 
 @define
 class RunSession:
@@ -50,13 +57,19 @@ class RunSession:
     The entire set of systems that are being run within this session of the 
     client, including all settings.
     """
-    seekrflow_objects: list[Seekrflow] = field(
+    systemrun_objects: list[SystemRun] = field(
         validator=validators.instance_of(list),
         factory=list,
     )
     batch_directory: str | None = field(
         default=None, validator=validators.optional(
             validators.instance_of(str)))
+    backend: typing.Any = field(default=None)
+    workflow_engine: typing.Any = field(default=None)
+    output_file: str = field(
+        default="", validator=validators.instance_of(str))
+    control_file: str = field(
+        default="", validator=validators.instance_of(str))
     max_concurrent_local_runs: int = field(
         default=DEFAULT_MAX_CONCURRENT_LOCAL_RUNS,
         validator=validators.and_(
@@ -203,6 +216,7 @@ class Batch:
     # in inputs
     _source_path: str | None = field(default=None, eq=False, repr=False)
     _source_dir: str | None = field(default=None, eq=False, repr=False)
+    _existing_seekrflow: Seekrflow | None = field(default=None, eq=False, repr=False)
 
     def resolve_directory(self) -> str:
         """
@@ -282,7 +296,7 @@ class Batch:
         merged = absolutize_existing_paths(merged, path_base)
         work_dir = self.system_work_directory(system.name)
         os.makedirs(work_dir, exist_ok=True)
-        os.makedirs(os.path.join(work_dir, "logs"), exist_ok=True)
+        #os.makedirs(os.path.join(work_dir, "logs"), exist_ok=True)
         merged["name"] = system.name
         merged["work_directory"] = work_dir
         json_path = os.path.join(work_dir, SEEKRFLOW_JSON_NAME)
@@ -297,12 +311,43 @@ class Batch:
         """
         return [self.materialize_one(system) for system in self.systems]
 
-    def create_session(self) -> RunSession:
+    def create_session(
+            self,
+            output_file: str | None,
+            control_file: str | None,
+            ) -> RunSession:
         """
         Create a RunSession from this Batch.
         """
+        if self.batch_directory is not None:
+            seekrflow_objects=self.materialize_all()
+        else:
+            seekrflow_objects=[self._existing_seekrflow] \
+                if self._existing_seekrflow else []
+        systemrun_objects = []
+        curdir = os.getcwd()
+        for seekrflow in seekrflow_objects:
+            if seekrflow.work_directory is not None:
+                seekrflow.work_directory = os.path.abspath(seekrflow.work_directory)
+                os.chdir(seekrflow.work_directory)
+            root_directory = str(seekrflow.get_root_directory())
+            model_filename = os.path.join(root_directory, "model.json")
+            model = seekr_structures.load_model(model_filename)
+            systemrun_objects.append(SystemRun(
+                name=seekrflow.name,
+                seekrflow=seekrflow,
+                model=model,
+                semaphore_dict={},
+                force_rerun_stages=[],
+                benchmark_stage=None,
+                #stage_plans=[],
+            ))
+            os.chdir(curdir)
+
         return RunSession(
-            seekrflow_objects=self.materialize_all(),
+            systemrun_objects=systemrun_objects,
+            output_file=output_file,
+            control_file=control_file,
             batch_directory=self.batch_directory,
             max_concurrent_local_runs=self.max_concurrent_local_runs,
             background_poll_interval=self.background_poll_interval,

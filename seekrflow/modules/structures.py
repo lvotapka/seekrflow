@@ -216,7 +216,33 @@ class Resource_local(Resource_base):
     """
     Local resource for running the protocol.
     """
-    pass
+    type: typing.Literal["local"] = "local"
+    remote_working_directory: str = field(
+        default="",
+        validator=validators.instance_of(str),
+        )
+    cpus_per_task: int = field(
+        default=1,
+        validator=validators.instance_of(int),
+    )
+    mps: int = field(
+        default=1,
+        validator=validators.instance_of(int),
+    )
+    remote_interface: (
+        Remote_interface_globus_compute_sdk
+        | Remote_interface_ssh
+        | Remote_interface_local_shell
+    ) = field(
+        default=Factory(Remote_interface_globus_compute_sdk),
+    )
+    transfer_settings: (
+        Transfer_settings_rsync
+        | Transfer_settings_globus
+        | Transfer_settings_none
+    ) = field(
+        default=Factory(Transfer_settings_globus),
+    )
 
 @define
 class Resource_remote_base(Resource_base):
@@ -225,7 +251,7 @@ class Resource_remote_base(Resource_base):
     """
     pass
 
-
+# TODO: review to see if necessary or better placed elsewhere.
 def _validate_local_shell_transfer_none(resource: Resource_remote_base) -> None:
     """local_shell requires transfer_settings.type == 'none'."""
     remote_interface = getattr(resource, "remote_interface", None)
@@ -560,136 +586,9 @@ class Resolved_execution:
     memory_mb: int | None
     time_limit: str | None  # HH:MM:SS; None when adaptive
     mps: int | None
-    time_policy: Time_policy_base = field(
+    time_policy: Time_policy_base | None = field(
         default=Factory(Time_policy_adaptive),
         validator=validators.instance_of(Time_policy_base))
-
-def resource_supports_arrays(resource: Resource_base | None) -> bool:
-    return isinstance(
-        resource,
-        (Resource_remote_slurm, Resource_remote_pbs, Resource_cloud_aws),
-    )
-
-def _collect_matching_placements(
-        address: list[str],
-        placements: list[Placement],
-        ) -> list[Placement]:
-    seen_targets: set[tuple[str, ...]] = set()
-    matching: list[Placement] = []
-    for placement in placements:
-        target_key = tuple(placement.target)
-        if target_key in seen_targets:
-            raise ValueError(
-                f"Duplicate placement target {list(target_key)!r}.")
-        seen_targets.add(target_key)
-        if _placement_targets_match(address, placement.target):
-            matching.append(placement)
-    # Broadest (shortest target) first so more specific placements override.
-    # An empty target ([]) is the broadest of all and acts as the default.
-    matching.sort(key=lambda p: len(p.target))
-    return matching
-
-
-def _apply_placement_fields(
-        accumulator: dict,
-        placement: Placement,
-        ) -> None:
-    if placement.resource is not None:
-        accumulator["resource"] = placement.resource
-    if placement.co_schedule_with is not None:
-        accumulator["co_schedule_with"] = placement.co_schedule_with
-    if placement.cpus is not None:
-        accumulator["cpus"] = placement.cpus
-    if placement.memory_mb is not None:
-        accumulator["memory_mb"] = placement.memory_mb
-    if placement.time_limit is not None:
-        accumulator["time_limit"] = placement.time_limit
-    if placement.mps is not None:
-        accumulator["mps"] = placement.mps
-    if placement.time_policy is not None:
-        accumulator["time_policy"] = placement.time_policy
-    if placement.dispatch is not None:
-        base = accumulator.get(
-            "dispatch", stage_procedures_module.Dispatch())
-        accumulator["dispatch"] = base.merged_with(placement.dispatch)
-
-def _resolve_time_policy_fields(
-        *,
-        stage_name: str,
-        resource_name: str,
-        resource: Resource_base | None,
-        placement_time_limit: str | None,
-        time_policy: Time_policy_base | None,
-        ) -> tuple[str | None, Time_policy_base]:
-    """
-    Resolve Placement time_policy + time_limit against the Resource cap.
-
-    Returns ``(resolved_time_limit, concrete_policy)``. For adaptive policies
-    ``resolved_time_limit`` is None (submit estimates walltime).
-    """
-    policy: Time_policy_base = (
-        time_policy if time_policy is not None else Time_policy_adaptive())
-    resource_cap = _resource_cap_time_limit(resource)
-    _ensure_time_limit_within_cap(
-        f"Placement for stage {stage_name!r}",
-        placement_time_limit,
-        resource_cap,
-        resource_name,
-    )
-
-    if isinstance(policy, Time_policy_fixed):
-        _ensure_time_limit_within_cap(
-            f"Time_policy_fixed for stage {stage_name!r}",
-            policy.time_limit,
-            resource_cap,
-            resource_name,
-        )
-        effective = policy.time_limit or placement_time_limit or resource_cap
-        _ensure_time_limit_within_cap(
-            f"Resolved fixed walltime for stage {stage_name!r}",
-            effective,
-            resource_cap,
-            resource_name,
-        )
-        return effective, policy
-
-    if isinstance(policy, Time_policy_adaptive):
-        _ensure_time_limit_within_cap(
-            f"Time_policy_adaptive.max_time_limit for stage {stage_name!r}",
-            policy.max_time_limit,
-            resource_cap,
-            resource_name,
-        )
-        _ensure_time_limit_within_cap(
-            f"Time_policy_adaptive.min_time_limit for stage {stage_name!r}",
-            policy.min_time_limit,
-            resource_cap,
-            resource_name,
-        )
-        max_tl = policy.max_time_limit or placement_time_limit
-        _ensure_time_limit_within_cap(
-            f"Adaptive max walltime for stage {stage_name!r}",
-            max_tl,
-            resource_cap,
-            resource_name,
-        )
-        if (policy.min_time_limit is not None and max_tl is not None
-                and time_limit_to_seconds(policy.min_time_limit)
-                > time_limit_to_seconds(max_tl)):
-            raise ValueError(
-                f"Stage {stage_name!r} adaptive min_time_limit "
-                f"{policy.min_time_limit!r} exceeds max {max_tl!r}.")
-        normalized = Time_policy_adaptive(
-            estimated_performance=policy.estimated_performance,
-            safety_factor=policy.safety_factor,
-            min_time_limit=policy.min_time_limit,
-            max_time_limit=max_tl,
-        )
-        return None, normalized
-
-    # Unknown / base policy: treat as adaptive defaults.
-    return None, Time_policy_adaptive(max_time_limit=placement_time_limit)
-
 
 @define
 class Run_settings:
@@ -742,87 +641,18 @@ class Run_settings:
                 return
         self.placements.append(Placement(target=list(target), resource=resource_name))
 
-    # TODO: see if this could be moved to the client code, possible if that's
-    # the place where this is called - can be converted into a function.
-    def resolve_stage_execution(
-            self,
-            stage_name: str,
-            procedure: stage_procedures_module.Stage_procedure_base,
-            ) -> Resolved_execution:
-        """
-        Resolve the full execution policy for a stage from procedure defaults,
-        placements (longest-prefix wins), and resource defaults.
-        """
-        address_map = stage_procedures_module.build_stage_address_map(procedure)
-        if stage_name not in address_map:
-            raise ValueError(
-                f"Stage '{stage_name}' is not produced by any procedure.")
-        address, _role = address_map[stage_name]
+    
 
-        accumulator: dict = {}
-        policy_map = stage_procedures_module.build_stage_policy_map(procedure)
-        emitted = policy_map[stage_name]
-        accumulator["dispatch"] = emitted.dispatch
-        if emitted.co_schedule_with is not None:
-            accumulator["co_schedule_with"] = emitted.co_schedule_with
-
-        for placement in _collect_matching_placements(
-                address, self.placements):
-            _apply_placement_fields(accumulator, placement)
-
-        resource_name = accumulator.get("resource", "local")
-        resource = self.get_resource_by_name(resource_name)
-        defaults = _resource_compute_defaults(resource)
-
-        cpus = accumulator.get("cpus", defaults["cpus"])
-        memory_mb = accumulator.get("memory_mb", defaults["memory_mb"])
-        mps = accumulator.get("mps", defaults["mps"])
-        time_limit, time_policy = _resolve_time_policy_fields(
-            stage_name=stage_name,
-            resource_name=resource_name,
-            resource=resource,
-            placement_time_limit=accumulator.get("time_limit"),
-            time_policy=accumulator.get("time_policy"),
-        )
-
-        dispatch = accumulator.get(
-            "dispatch", stage_procedures_module.Dispatch())
-        if resource is None or not resource_supports_arrays(resource):
-            dispatch = stage_procedures_module.Dispatch(
-                dimensions=dispatch.dimensions,
-                group_size=None,
-                concurrency=dispatch.concurrency,
-            )
-        max_concurrency = mps if mps is not None else 1
-        if dispatch.concurrency > max_concurrency:
-            raise ValueError(
-                f"Stage '{stage_name}' has dispatch.concurrency={dispatch.concurrency} "
-                f"but resource '{resource_name}' has mps={max_concurrency}. "
-                f"Reduce dispatch.concurrency to <= {max_concurrency}.")
-
-        return Resolved_execution(
-            stage_name=stage_name,
-            resource_name=resource_name,
-            resource=resource,
-            dispatch=dispatch,
-            co_schedule_with=accumulator.get("co_schedule_with"),
-            cpus=cpus,
-            memory_mb=memory_mb,
-            time_limit=time_limit,
-            mps=mps,
-            time_policy=time_policy,
-        )
-
-    def get_stage_resource(
-            self,
-            stage_name: str,
-            procedure: stage_procedures_module.Stage_procedure_base,
-            ) -> Resource_base | None:
-        """
-        Get the resource for a given stage (None means local).
-        """
-        return self.resolve_stage_execution(
-            stage_name, procedure).resource
+    #def get_stage_resource(
+    #        self,
+    #        stage_name: str,
+    #        procedure: stage_procedures_module.Stage_procedure_base,
+    #        ) -> Resource_base | None:
+    #    """
+    #    Get the resource for a given stage (None means local).
+    #    """
+    #    return self.resolve_stage_execution(
+    #        stage_name, procedure).resource
 
 @define
 class Seekrflow:
@@ -889,12 +719,9 @@ class Seekrflow:
         validator=validators.instance_of(Run_settings),
     )
 
-    def save(
-            self,
-            filename: str
-            ) -> None:
+    def to_dict(self) -> dict:
         """
-        Save the Seekrflow object to a JSON file.
+        Convert the Seekrflow object to a dictionary.
         """
         converter: cattrs.Converter = cattrs.Converter()
         # Make sure that interited data classes are unstructured as their
@@ -904,6 +731,16 @@ class Seekrflow:
         include_subclasses(Resource_base, converter)
         include_subclasses(Time_policy_base, converter)
         seekrflow_dict: dict = converter.unstructure(self)
+        return seekrflow_dict
+
+    def save(
+            self,
+            filename: str
+            ) -> None:
+        """
+        Save the Seekrflow object to a JSON file.
+        """
+        seekrflow_dict = self.to_dict()
         json_dump: str = json.dumps(seekrflow_dict, indent=4)
         with open(filename, "w") as file:
             file.write(json_dump)

@@ -1,9 +1,9 @@
 """
 AWS Batch workload manager (client-side boto3).
 
-Submit / status / cancel for ``aws_cloud`` resources. Seekr progress is
+Submit / status / cancel for "aws_cloud" resources. Seekr progress is
 published by the container to S3; manager liveness comes from
-``batch.describe_jobs``.
+"batch.describe_jobs".
 """
 from __future__ import annotations
 
@@ -24,13 +24,13 @@ CONTAINER_WORK_DIR = "/work"
 CLOUDWATCH_LOG_GROUP = "/aws/batch/job"
 FAILURE_LOG_TAIL_LINES = 100
 
-
+# TODO: only referenced once - collapse into its one use
 def sanitize_job_definition_name(name: str) -> str:
     """AWS job definition names: letters, numbers, underscores, hyphens."""
     cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", name.strip()) or "seekrflow"
     return cleaned[:128]
 
-
+# TODO: only referenced once - collapse into its one use
 def job_definition_name_for_resource(resource: "structures.Resource_cloud_aws") -> str:
     return sanitize_job_definition_name(f"seekrflow-{resource.name}")
 
