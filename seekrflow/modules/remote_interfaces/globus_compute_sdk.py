@@ -92,11 +92,11 @@ def submit_remote_workload_with_globus_compute(
         future = gcx.submit_to_registered_function(
             function_id=function_id, args=(args,))
 
-    try:
-        return future.result(timeout=GLOBUS_RESULT_TIMEOUT_S)
-    except TimeoutError as e:
-        raise TimeoutError(
-            f"Globus Compute task on endpoint {resource_name!r} exceeded "
-            f"{GLOBUS_RESULT_TIMEOUT_S:.0f}s waiting for a result; "
-            f"will retry on the next poll"
-        ) from e
+        try:
+            return future.result(timeout=GLOBUS_RESULT_TIMEOUT_S)
+        except TimeoutError as e:
+            raise TimeoutError(
+                f"Globus Compute task on endpoint {resource_name!r} exceeded "
+                f"{GLOBUS_RESULT_TIMEOUT_S:.0f}s waiting for a result; "
+                f"will retry on the next poll"
+            ) from e
