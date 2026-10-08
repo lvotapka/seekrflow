@@ -105,7 +105,7 @@ def create_example_seekrflow(ff="amber") -> structures.Seekrflow:
     delta_slurm_resource.nodes_per_block = 1
     delta_slurm_resource.cpus_per_task = 32
     delta_slurm_resource.memory_per_node = 48000
-    delta_slurm_resource.time_limit = "00:30:00"
+    delta_slurm_resource.max_time_limit = "00:30:00"
     delta_slurm_resource.scheduler_options = "#SBATCH --gpus-per-node=1 --gpu-bind=closest"
     delta_slurm_resource.worker_init = "source $HOME/.bashrc; "\
                             "conda activate SEEKR2; "\

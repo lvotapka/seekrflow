@@ -12,9 +12,8 @@ import tempfile
 # Absolute symlinks under these dirs break container ``tar`` extract.
 LOCAL_RUNNER_DIRNAMES = (
     ".multiprocessing",
-    ".aws_runner",
-    ".slurm_runner",
-    ".pbs_runner",
+    ".seekr_runner",
+    ".batch_runner",
 )
 
 

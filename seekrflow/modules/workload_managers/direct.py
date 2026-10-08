@@ -1,11 +1,11 @@
 """
-Local multiprocessing workload manager functions for local job submission, status checking, 
-and cancellation.
+Direct workload manager functions for direct local/head node job submission, 
+status checking, and cancellation.
 """
 
-def local_run_workload(args):
+def direct_run_workload(args):
     """
-    Submit a local workload.
+    Submit a direct workload.
     """
     import os
     import sys
@@ -60,8 +60,8 @@ def local_run_workload(args):
     root_dir_path = pathlib.Path(root_dir)
     model_filename = root_dir_path / "model.json"
     
-    def get_local_dir(root_dir: pathlib.Path) -> pathlib.Path:
-        return root_dir / ".local_runner"
+    def get_direct_dir(root_dir: pathlib.Path) -> pathlib.Path:
+        return root_dir / ".direct_runner"
 
     def get_stage_dir(root_dir: pathlib.Path) -> pathlib.Path:
         return root_dir / ".stage_states"
@@ -69,16 +69,16 @@ def local_run_workload(args):
     def get_internal_id():
         """
         Since job IDs aren't assigned until the job is submitted, we need a way to
-        choose an internal, seekrflow-specific ID to use for Stage and Slurm Info
-        and State files. This can just be where the slurm runner directory
+        choose an internal, seekrflow-specific ID to use for Stage and Direct Info
+        and State files. This can just be where the direct runner directory
         has its content file names split by underscore and the ID is after the first
         underscore or something.
         """
-        local_runner_dir = get_local_dir(root_dir)
-        if not local_runner_dir.exists():
+        direct_runner_dir = get_direct_dir(root_dir)
+        if not direct_runner_dir.exists():
             return 0
         files = sorted(
-            local_runner_dir.glob("*.json"),
+            direct_runner_dir.glob("*.json"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -86,37 +86,18 @@ def local_run_workload(args):
             ids = [file.stem.split("_")[-1] for file in files]
             return max(int(id) for id in ids) + 1
         return 0
-    """ # TODO: marked for removal
-    def collapse_indices(
-            idxs: List[int]
-            ) -> str:
-        ""
-        Collapse [0,1,2,5,6,9] -> '0-2,5-6,9'
-        ""
-        if not idxs: return ""
-        idxs = sorted(set(idxs))
-        ranges = []
-        start = prev = idxs[0]
-        for x in idxs[1:]:
-            if x == prev + 1:
-                prev = x
-            else:
-                ranges.append(f"{start}-{prev}" if start != prev else str(start))
-                start = prev = x
-        ranges.append(f"{start}-{prev}" if start != prev else str(start))
-        return ",".join(ranges)
-    """
+
     @dataclass
-    class LocalInfo:
+    class DirectInfo:
         internal_id: int # The seekrflow-specific ID for this job. Used for info/state file names.
         root_dir: str
         log_dir: str # The directory in root_dir to write log files to.
-        cpus_per_task: int # SLURM cpus per task
+        cpus_per_task: int # Direct cpus per task
         n_tasks: int # The # runs in the job array. If array_spec is None, must be 1
         array_indices: Optional[list[int]] # The indices of the runs in the job array
         benchmark_mode: bool # Whether to run in benchmark mode
         filename: str
-        local_state_filename: str
+        direct_state_filename: str
         stage_info_filenames: List[str] # Multiple stages possible in a bundled job
         stage_state_filenames: List[str]
         # Below: assigned when the job is submitted
@@ -133,15 +114,15 @@ def local_run_workload(args):
                 ) -> None:
             if path is None:
                 if self.filename is None:
-                    raise ValueError("LocalInfo filename is required.")
+                    raise ValueError("DirectInfo filename is required.")
                 self.filename = pathlib.Path(self.filename).name
                 path_basename = pathlib.Path(self.filename)
                 assert root_dir_path is not None, "Root directory path is required."
-                path = root_dir_path / ".local_runner" / path_basename
+                path = root_dir_path / ".direct_runner" / path_basename
             else:
                 path_basename = path.name
                 self.filename = str(path_basename)
-            # Creates root_dir/.local_runner; fails if root_dir is missing
+            # Creates root_dir/.direct_runner; fails if root_dir is missing
             path.parent.mkdir(exist_ok=True)
             path_tmp = path.with_suffix(".tmp")
             with open(path_tmp, "w") as f:
@@ -149,19 +130,19 @@ def local_run_workload(args):
             os.rename(path_tmp, path)
 
         @staticmethod
-        def load(path: pathlib.Path) -> "LocalInfo":
+        def load(path: pathlib.Path) -> "DirectInfo":
             with open(path, "r") as f:
-                return LocalInfo(**json.load(f))
+                return DirectInfo(**json.load(f))
 
         def update(self, **kwargs) -> None:
             for key, value in kwargs.items():
                 setattr(self, key, value)
         
     @dataclass
-    class LocalState:
+    class DirectState:
         internal_id: int
         filename: str
-        local_info_filename: str
+        direct_info_filename: str
         state: str # 'pending', 'running', 'idle', 'failed'
         notes: Optional[str] = None
         last_timestamp: Optional[float] = None
@@ -175,15 +156,15 @@ def local_run_workload(args):
                 ) -> None:
             if path is None:
                 if self.filename is None:
-                    raise ValueError("LocalState filename is required.")
+                    raise ValueError("DirectState filename is required.")
                 self.filename = pathlib.Path(self.filename).name
                 path_basename = pathlib.Path(self.filename)
                 assert root_dir_path is not None, "Root directory path is required."
-                path = root_dir_path / ".local_runner" / path_basename
+                path = root_dir_path / ".direct_runner" / path_basename
             else:
                 path_basename = path.name
                 self.filename = str(path_basename)
-            # Creates root_dir/.local_runner; fails if root_dir is missing
+            # Creates root_dir/.direct_runner; fails if root_dir is missing
             path.parent.mkdir(exist_ok=True)
             path_tmp = path.with_suffix(".tmp")
             with open(path_tmp, "w") as f:
@@ -191,40 +172,40 @@ def local_run_workload(args):
             os.rename(path_tmp, path)
 
         @staticmethod
-        def load(path: pathlib.Path) -> "LocalState":
+        def load(path: pathlib.Path) -> "DirectState":
             with open(path, "r") as f:
-                return LocalState(**json.load(f))
+                return DirectState(**json.load(f))
 
         def update(self, **kwargs) -> None:
             for key, value in kwargs.items():
                 setattr(self, key, value)
 
     # 1. perform preliminary checks: make sure model.json exists, fill out StageInfo 
-    #    for each stage being submitted. Write out a preliminary LocalInfo, 
-    #    LocalState, StageInfo, and StateState files.
-    # NOTE: keeping asserts on worker - will be propagated back to local
+    #    for each stage being submitted. Write out a preliminary DirectInfo, 
+    #    DirectState, StageInfo, and StateState files.
+    # NOTE: keeping asserts on worker - will be propagated back to direct
     if not root_dir_path.exists():
         return {"success": False, "error": "Root directory does not exist"}
     if not root_dir_path.is_dir():
         return {"success": False, "error": "Root directory is not a directory"}
     if not model_filename.exists():
         return {"success": False, "error": "Model file does not exist"}
-    local_dir_path = get_local_dir(root_dir_path)
+    direct_dir_path = get_direct_dir(root_dir_path)
     stage_dir_path = get_stage_dir(root_dir_path)
     internal_id = get_internal_id()
     for job_spec in job_specs:
         job_spec.internal_id = internal_id
     LOG_DIR = "logs"
     log_dir_path = root_dir_path / LOG_DIR
-    local_info_basename = f"local_info_{internal_id}.json"
-    local_state_basename = f"local_state_{internal_id}.json"
+    direct_info_basename = f"direct_info_{internal_id}.json"
+    direct_state_basename = f"direct_state_{internal_id}.json"
     stage_info_filenames = []
     stage_state_filenames = []
     stage_info_basenames = []
     stage_state_basenames = []
     for stage_index in stage_indices:
         stage_info_filename = stage_dir_path / f"stage_info_{internal_id}_{stage_index}.json"
-        stage_state_filename = stage_dir_path / f"stage_state_{internal_id}_{stage_index}.json"
+        stage_state_filename = stage_dir_path / f"stage_state_{internal_id}_{stage_index}_{array_index}.json"
         stage_info_basenames.append(stage_info_filename.name)
         stage_state_basenames.append(stage_state_filename.name)
         stage_info_filenames.append(str(stage_info_filename))
@@ -250,8 +231,8 @@ def local_run_workload(args):
         job_spec.save(job_spec_path)
         job_spec_paths.append(str(job_spec_path))
 
-    # Write out preliminary SlurmInfo, SlurmState, StageInfo, and StageState files
-    local_info = LocalInfo(
+    # Write out preliminary DirectInfo, DirectState, StageInfo, and StageState files
+    direct_info = DirectInfo(
         internal_id=internal_id,
         root_dir=root_dir,
         log_dir=LOG_DIR,
@@ -259,19 +240,19 @@ def local_run_workload(args):
         n_tasks=n_tasks,
         array_indices=array_indices,
         benchmark_mode=benchmark_mode,
-        filename=local_info_basename,
-        local_state_filename=local_state_basename,
+        filename=direct_info_basename,
+        direct_state_filename=direct_state_basename,
         stage_info_filenames=stage_info_basenames,
         stage_state_filenames=stage_state_basenames,
     )
-    local_info.save(root_dir_path=root_dir_path, path=local_info_basename)
-    local_state = LocalState(
+    direct_info.save(root_dir_path=root_dir_path, path=direct_info_basename)
+    direct_state = DirectState(
         internal_id=internal_id,
-        filename=local_state_basename,
-        local_info_filename=local_info_basename,
+        filename=direct_state_basename,
+        direct_info_filename=direct_info_basename,
         state="pending",
     )
-    local_state.save(root_dir_path=root_dir_path, path=local_state_basename)
+    direct_state.save(root_dir_path=root_dir_path, path=direct_state_basename)
     
     starting_stage_infos = []
     starting_stage_states = []
@@ -299,7 +280,7 @@ def local_run_workload(args):
         )
         starting_stage_state.save(root_dir_path=root_dir_path, path=stage_state_basenames[i])
         
-    # 2. submit the job to local
+    # 2. submit the job to direct
     log_dir_path.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(cpus_per_task)
@@ -330,28 +311,30 @@ def local_run_workload(args):
             stderr_f.close()
         process_ids.append(proc.pid)
     
-    local_info.process_ids = process_ids
-    local_info.process_stdout_filenames = stdout_basenames
-    local_info.process_stderr_filenames = stderr_basenames
-    local_info.submitted_at = time.time()
-    local_info.save(root_dir_path=root_dir_path, path=local_info_basename)
-    local_state.state = "running"
-    local_state.last_timestamp = time.time()
-    local_state.last_known_jobs = [str(pid) for pid in process_ids]
-    local_state.save(root_dir_path=root_dir_path, path=local_state_basename)
+    direct_info.process_ids = process_ids
+    direct_info.process_stdout_filenames = stdout_basenames
+    direct_info.process_stderr_filenames = stderr_basenames
+    direct_info.submitted_at = time.time()
+    direct_info.save(root_dir_path=root_dir_path, path=direct_info_basename)
+    direct_state.state = "running"
+    direct_state.last_timestamp = time.time()
+    direct_state.last_known_jobs = [str(pid) for pid in process_ids]
+    direct_state.save(root_dir_path=root_dir_path, path=direct_state_basename)
 
     return {
         "success": True, 
         "error": None, 
         "internal_id": internal_id,
         "process_ids": process_ids,
+        "job_id": internal_id,
+        "job_name": job_name,
     }
 
-def local_status_workload(args):
+def direct_status_workload(args):
     """
-    Local status workflow
+    Direct status workflow
 
-    Load the LocalInfo and LocalState files and return them.
+    Load the DirectInfo and DirectState files and return them.
     """
     import os
     import json
@@ -363,10 +346,10 @@ def local_status_workload(args):
     from dataclasses import dataclass, asdict
 
     @dataclass
-    class LocalState:
+    class DirectState:
         internal_id: int
         filename: str
-        local_info_filename: str
+        direct_info_filename: str
         state: str # 'pending', 'running', 'idle', 'failed'
         notes: Optional[str] = None
         last_timestamp: Optional[float] = None
@@ -380,15 +363,15 @@ def local_status_workload(args):
                 ) -> None:
             if path is None:
                 if self.filename is None:
-                    raise ValueError("LocalState filename is required.")
+                    raise ValueError("DirectState filename is required.")
                 self.filename = pathlib.Path(self.filename).name
                 path_basename = pathlib.Path(self.filename)
                 assert root_dir_path is not None, "Root directory path is required."
-                path = root_dir_path / ".local_runner" / path_basename
+                path = root_dir_path / ".direct_runner" / path_basename
             else:
                 path_basename = path.name
                 self.filename = str(path_basename)
-            # Creates root_dir/.local_runner; fails if root_dir is missing
+            # Creates root_dir/.direct_runner; fails if root_dir is missing
             path.parent.mkdir(exist_ok=True)
             path_tmp = path.with_suffix(".tmp")
             with open(path_tmp, "w") as f:
@@ -396,9 +379,9 @@ def local_status_workload(args):
             os.rename(path_tmp, path)
 
         @staticmethod
-        def load(path: pathlib.Path) -> "LocalState":
+        def load(path: pathlib.Path) -> "DirectState":
             with open(path, "r") as f:
-                return LocalState(**json.load(f))
+                return DirectState(**json.load(f))
 
         def update(self, **kwargs) -> None:
             for key, value in kwargs.items():
@@ -436,44 +419,44 @@ def local_status_workload(args):
     
     incoming_payload = args[0]
     return_payload = {}
-    for system_name, payload in incoming_payload.items():
+    for system_name, payload in incoming_payload["system_payloads"].items():
         root_dir_path = pathlib.Path(payload["root_dir"])
         if not root_dir_path.exists():
             return {"success": False, "error": "Root directory does not exist"}
         if not root_dir_path.is_dir():
             return {"success": False, "error": "Root directory is not a directory"}
 
-        local_dir_path = root_dir_path / ".local_runner"
+        direct_dir_path = root_dir_path / ".direct_runner"
         stage_dir_path = root_dir_path / ".stage_states"
         job_dicts_by_job_id = {}
         for job in payload["jobs"]:
             internal_id = job["internal_id"]
-            process_id = job["job_id"]
+            #process_id = job["job_id"]
             stage_indices = job["stage_indices"]
             array_indices = job["array_indices"] or []
-            info_path = local_dir_path / f"local_info_{internal_id}.json"
-            state_path = local_dir_path / f"local_state_{internal_id}.json"
+            info_path = direct_dir_path / f"direct_info_{internal_id}.json"
+            state_path = direct_dir_path / f"direct_state_{internal_id}.json"
             if not info_path.exists() or not state_path.exists():
                 return {
                     "success": False,
-                    "error": f"Local runner files missing for internal_id {internal_id}",
+                    "error": f"Direct runner files missing for internal_id {internal_id}",
                 }
-            local_info = parse_json_file_to_dict(info_path)
-            local_state = LocalState.load(state_path)
-            process_ids = local_info.get("process_ids") or []
-            info_array_indices = local_info.get("array_indices") or []
+            direct_info = parse_json_file_to_dict(info_path)
+            direct_state = DirectState.load(state_path)
+            process_ids = direct_info.get("process_ids") or []
+            info_array_indices = direct_info.get("array_indices") or []
             pid_by_array_index = {
                 index: pid for index, pid in zip(info_array_indices, process_ids)
             }
-            elapsed = elapsed_since(local_info.get("submitted_at"))
+            elapsed = elapsed_since(direct_info.get("submitted_at"))
 
-            local_dicts_by_array_index = {}
+            direct_dicts_by_array_index = {}
             live_pids = []
             for array_index in array_indices:
                 pid = pid_by_array_index.get(array_index)
                 if pid is not None and pid_is_running(pid):
                     live_pids.append(str(pid))
-                local_dicts_by_array_index[array_index] = {
+                direct_dicts_by_array_index[array_index] = {
                     "internal_id": internal_id,
                     "state": "running" if pid is not None and pid_is_running(pid) else "idle",
                     "last_timestamp": time.time(),
@@ -481,32 +464,56 @@ def local_status_workload(args):
                     "last_known_jobs": [str(pid)] if pid is not None else [],
                 }
             
-            array_states = {item["state"] for item in local_dicts_by_array_index.values()}
+            array_states = {item["state"] for item in direct_dicts_by_array_index.values()}
             if "running" in array_states:
-                local_state.state = "running"
+                direct_state.state = "running"
             else:
-                local_state.state = "idle"
-                local_state.last_timestamp = time.time()
-                local_state.last_known_elapsed = [elapsed] if elapsed is not None else None
-                local_state.last_known_jobs = live_pids
-                local_state.save(root_dir_path=root_dir_path, path=state_path)
+                direct_state.state = "idle"
+                direct_state.last_timestamp = time.time()
+                direct_state.last_known_elapsed = [elapsed] if elapsed is not None else None
+                direct_state.last_known_jobs = live_pids
+                direct_state.save(root_dir_path=root_dir_path, path=state_path)
 
+            list_fields = (
+                "stage_anchor_swarm_progress_list",
+                "stage_anchor_swarm_starting_step_list",
+                "stage_anchor_swarm_current_step_list",
+                "stage_anchor_swarm_total_steps_list",
+                "stage_anchor_swarm_time_of_first_progress_list",
+                "stage_anchor_swarm_time_of_last_progress_list",
+            )
             stage_dicts_by_stage_index = {}
             for stage_index in stage_indices:
-                stage_state_path = stage_dir_path / f"stage_state_{internal_id}_{stage_index}.json"
-                if stage_state_path.exists():
-                    stage_dicts_by_stage_index[stage_index] = parse_json_file_to_dict(
-                        stage_state_path)
+                member_dicts = []
+                for array_index in array_indices:
+                    stage_state_path = stage_dir_path / (
+                        f"stage_state_{internal_id}_{stage_index}_{array_index}.json")
+                    if stage_state_path.exists():
+                        member_dicts.append(parse_json_file_to_dict(stage_state_path))
+                    else:
+                        member_dicts.append({"state": "unstarted", "finished": False})
+                states = [member.get("state") or "unstarted" for member in member_dicts]
+                if "error" in states:
+                    state = "error"
+                elif states and all(member_state == "completed" for member_state in states):
+                    state = "completed"
+                elif any(member_state in ("started", "completed") for member_state in states):
+                    state = "started"
                 else:
-                    stage_dicts_by_stage_index[stage_index] = {
-                        "internal_id": internal_id,
-                        "state": "unknown",
-                        "finished": False,
-                        "stage_anchor_swarm_progress_list": None,
-                    }
-            # Same key the session monitor already reads from the SLURM status payload.
-            job_dicts_by_job_id[internal_id] = {
-                "slurm_dicts_by_array_index": local_dicts_by_array_index,
+                    state = "unstarted"
+                merged = {
+                    "internal_id": internal_id,
+                    "state": state,
+                    "finished": all(bool(member.get("finished")) for member in member_dicts),
+                }
+                for field in list_fields:
+                    combined = []
+                    for member in member_dicts:
+                        combined.extend(member.get(field) or [])
+                    merged[field] = combined or None
+                stage_dicts_by_stage_index[stage_index] = merged
+            job_dicts_by_job_id[job["job_id"]] = {
+                "manager_dicts_by_array_index": direct_dicts_by_array_index,
                 "stage_dicts_by_stage_index": stage_dicts_by_stage_index,
             }
         # Name it job_dicts_by_internal_id ??
@@ -516,4 +523,35 @@ def local_status_workload(args):
         "success": True,
         "error": None,
         "payload": return_payload,
+    }
+
+def direct_cancel_workload(args):
+    import os
+    import signal
+    import json
+    import pathlib
+    incoming = args[0]
+    canceled = []
+    errors = []
+    for payload in incoming["system_payloads"].values():
+        root = pathlib.Path(payload["root_dir"])
+        for job in payload["jobs"]:
+            internal_id = job.get("internal_id", job.get("job_id"))
+            info_path = root / ".direct_runner" / f"direct_info_{internal_id}.json"
+            if not info_path.exists():
+                errors.append(f"missing {info_path.name}")
+                continue
+            info = json.loads(info_path.read_text())
+            for pid in info.get("process_ids") or []:
+                try:
+                    os.killpg(int(pid), signal.SIGTERM)
+                    canceled.append(int(pid))
+                except ProcessLookupError:
+                    pass
+                except Exception as error:
+                    errors.append(f"{pid}: {error}")
+    return {
+        "success": not errors,
+        "error": "; ".join(errors) or None,
+        "payload": canceled,
     }

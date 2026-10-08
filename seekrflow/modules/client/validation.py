@@ -52,19 +52,19 @@ def _resource_compute_defaults(
     """
     Backend-native Resource fields → agnostic compute defaults for resolve.
     """
-    if resource is None:
+    if isinstance(resource, (structures.Resource_direct)):
         return {
-            "cpus": None,
+            "cpus": resource.cpus_per_task,
             "memory_mb": None,
-            "time_limit": None,
-            "mps": 1,
+            "time_limit": resource.max_time_limit,
+            "mps": resource.mps,
         }
     if isinstance(resource, (structures.Resource_remote_slurm, 
                              structures.Resource_remote_pbs)):
         return {
             "cpus": resource.cpus_per_task,
             "memory_mb": resource.memory_per_node,
-            "time_limit": resource.time_limit,
+            "time_limit": resource.max_time_limit,
             "mps": resource.mps,
         }
     if isinstance(resource, structures.Resource_cloud_aws):
@@ -145,7 +145,6 @@ def _co_schedule_host_name(
         co_schedule_with: str,
         stage_index: int,
         model_stages: list,
-        stage_names: list[str],
         ) -> str:
     """
     Determine the name of the stage that a given stage is co-scheduled with.
@@ -198,12 +197,6 @@ def validate_run_settings(
             resource = seekrflow.run_settings.get_resource_by_name(
                 placement.resource)
             resource_cap = _resource_cap_time_limit(resource)
-            _ensure_time_limit_within_cap(
-                f"Placement target {placement.target!r}",
-                placement.time_limit,
-                resource_cap,
-                placement.resource,
-            )
             if isinstance(placement.time_policy, structures.Time_policy_fixed):
                 _ensure_time_limit_within_cap(
                     f"Time_policy_fixed for target {placement.target!r}",
@@ -233,8 +226,8 @@ def validate_run_settings(
 
     stage_names = [stage.name for stage in model.stages]
     for stage_name in stage_names:
-        resolved = seekrflow.run_settings.resolve_stage_execution(
-            stage_name, procedure)
+        resolved = resolve_stage_execution(
+            seekrflow.run_settings, stage_name, procedure)
         if resolved.co_schedule_with is None:
             continue
         stage_index = stage_names.index(stage_name)
@@ -243,17 +236,16 @@ def validate_run_settings(
             resolved.co_schedule_with,
             stage_index,
             model.stages,
-            stage_names,
         )
-        neighbor_resolved = seekrflow.run_settings.resolve_stage_execution(
-            neighbor_name, procedure)
-        if neighbor_resolved.resource_name != resolved.resource_name:
+        neighbor_resolved = resolve_stage_execution(
+            seekrflow.run_settings, neighbor_name, procedure)
+        if neighbor_resolved.resource.name != resolved.resource.name:
             raise ValueError(
                 f"Stage {stage_name!r} co_schedule_with "
                 f"{resolved.co_schedule_with!r} requires the same resource "
                 f"as neighbor {neighbor_name!r}, but "
-                f"{resolved.resource_name!r} != "
-                f"{neighbor_resolved.resource_name!r}.")
+                f"{resolved.resource.name!r} != "
+                f"{neighbor_resolved.resource.name!r}.")
         if resolved.dispatch.dimensions != neighbor_resolved.dispatch.dimensions:
             raise ValueError(
                 f"Host stage {neighbor_name!r} cannot co-schedule "
@@ -296,8 +288,6 @@ def _apply_placement_fields(
         accumulator["time_limit"] = placement.time_limit
     if placement.mps is not None:
         accumulator["mps"] = placement.mps
-    if placement.time_policy is not None:
-        accumulator["time_policy"] = placement.time_policy
     if placement.dispatch is not None:
         base = accumulator.get(
             "dispatch", stage_procedures_module.Dispatch())
@@ -308,7 +298,6 @@ def _resolve_time_policy_fields(
         stage_name: str,
         resource_name: str,
         resource: structures.Resource_base | None,
-        placement_time_limit: str | None,
         time_policy: structures.Time_policy_base | None,
         ) -> tuple[str | None, structures.Time_policy_base]:
     """
@@ -320,13 +309,6 @@ def _resolve_time_policy_fields(
     policy: structures.Time_policy_base = (
         time_policy if time_policy is not None else structures.Time_policy_adaptive())
     resource_cap = _resource_cap_time_limit(resource)
-    _ensure_time_limit_within_cap(
-        f"Placement for stage {stage_name!r}",
-        placement_time_limit,
-        resource_cap,
-        resource_name,
-    )
-
     if isinstance(policy, structures.Time_policy_fixed):
         _ensure_time_limit_within_cap(
             f"Time_policy_fixed for stage {stage_name!r}",
@@ -334,7 +316,7 @@ def _resolve_time_policy_fields(
             resource_cap,
             resource_name,
         )
-        effective = policy.time_limit or placement_time_limit or resource_cap
+        effective = policy.time_limit or resource_cap
         _ensure_time_limit_within_cap(
             f"Resolved fixed walltime for stage {stage_name!r}",
             effective,
@@ -356,29 +338,16 @@ def _resolve_time_policy_fields(
             resource_cap,
             resource_name,
         )
-        max_tl = policy.max_time_limit or placement_time_limit
-        _ensure_time_limit_within_cap(
-            f"Adaptive max walltime for stage {stage_name!r}",
-            max_tl,
-            resource_cap,
-            resource_name,
-        )
-        if (policy.min_time_limit is not None and max_tl is not None
+        if (policy.min_time_limit is not None and policy.max_time_limit is not None
                 and time_limit_to_seconds(policy.min_time_limit)
-                > time_limit_to_seconds(max_tl)):
+                > time_limit_to_seconds(policy.max_time_limit)):
             raise ValueError(
                 f"Stage {stage_name!r} adaptive min_time_limit "
-                f"{policy.min_time_limit!r} exceeds max {max_tl!r}.")
-        normalized = structures.Time_policy_adaptive(
-            estimated_performance=policy.estimated_performance,
-            safety_factor=policy.safety_factor,
-            min_time_limit=policy.min_time_limit,
-            max_time_limit=max_tl,
-        )
-        return None, normalized
+                f"{policy.min_time_limit!r} exceeds max {policy.max_time_limit!r}.")
+        return None, policy
 
     # Unknown / base policy: treat as adaptive defaults.
-    return None, structures.Time_policy_adaptive(max_time_limit=placement_time_limit)
+    return None, structures.Time_policy_adaptive(max_time_limit=resource_cap)
 
 def resource_supports_arrays(resource: structures.Resource_base | None) -> bool:
     return isinstance(
@@ -424,13 +393,12 @@ def resolve_stage_execution(
         stage_name=stage_name,
         resource_name=resource_name,
         resource=resource,
-        placement_time_limit=accumulator.get("time_limit"),
         time_policy=accumulator.get("time_policy"),
     )
 
     dispatch = accumulator.get(
         "dispatch", stage_procedures_module.Dispatch())
-    if resource is None or not resource_supports_arrays(resource):
+    if not resource_supports_arrays(resource):
         dispatch = stage_procedures_module.Dispatch(
             dimensions=dispatch.dimensions,
             group_size=None,
@@ -445,7 +413,6 @@ def resolve_stage_execution(
 
     return structures.Resolved_execution(
         stage_name=stage_name,
-        resource_name=resource_name,
         resource=resource,
         dispatch=dispatch,
         co_schedule_with=accumulator.get("co_schedule_with"),

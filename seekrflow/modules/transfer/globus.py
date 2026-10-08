@@ -6,6 +6,8 @@ where password entry and two-factor authentication would otherwise be
 burdensome.
 """
 
+# TODO: see if this module can be simplified
+
 from __future__ import annotations
 
 import os

@@ -57,6 +57,11 @@ class StageState:
     state: str = "unstarted" #'unstarted', 'started', 'completed', 'error', 'unknown'
     finished: bool = False
     stage_anchor_swarm_progress_list: Optional[List[Tuple[int, int | str, int | None, float]]] = None
+    stage_anchor_swarm_starting_step_list: Optional[List[Tuple[int, int | str, int | None, int]]] = None
+    stage_anchor_swarm_current_step_list: Optional[List[Tuple[int, int | str, int | None, int]]] = None
+    stage_anchor_swarm_total_steps_list: Optional[List[Tuple[int, int | str, int | None, int]]] = None
+    stage_anchor_swarm_time_of_first_progress_list: Optional[List[Tuple[int, int | str, int | None, float]]] = None
+    stage_anchor_swarm_time_of_last_progress_list: Optional[List[Tuple[int, int | str, int | None, float]]] = None
     status_info: Optional[dict] = None
     notes: Optional[str] = None
     filename: Optional[str] = None
@@ -88,17 +93,6 @@ class StageState:
     def load(path: pathlib.Path) -> "StageState":
         with open(path, "r") as f:
             return StageState(**json.load(f))
-
-# Might not really be necessary on this side - 
-# TODO: however there might need to be some object on the client side
-# to parse the telemetry output.
-#@dataclass
-#class TelemetryState:
-#    task_status: Dict[str, str] # taskid -> status
-#    cpu_usage: Dict[str, float] # taskid -> cpu usage
-#    memory_usage: Dict[str, float] # taskid -> memory usage
-#    # TODO: more here?
-#    filename: Optional[str] = None
 
 @dataclass(frozen=True)
 class RunUnit:
@@ -168,7 +162,7 @@ class JobSpec:
         root_dir_path = pathlib.Path(self.remote_root_dir)
         stage_info_basename = f"stage_info_{self.internal_id}_{stage_index}.json"
         stage_info_path = root_dir_path / ".stage_info_states" / stage_info_basename
-        stage_state_basename = f"stage_state_{self.internal_id}_{stage_index}.json"
+        stage_state_basename = f"stage_state_{self.internal_id}_{stage_index}_{self.array_index}.json"
         stage_state_path = root_dir_path / ".stage_states" / stage_state_basename
         if stage_state_path.exists():
             stage_state = StageState.load(stage_state_path)
@@ -185,7 +179,7 @@ class JobSpec:
         root_dir_path = pathlib.Path(self.remote_root_dir)
         stage_info_basename = f"stage_info_{self.internal_id}_{stage_index}.json"
         stage_info_path = root_dir_path / ".stage_info_states" / stage_info_basename
-        stage_state_basename = f"stage_state_{self.internal_id}_{stage_index}.json"
+        stage_state_basename = f"stage_state_{self.internal_id}_{stage_index}_{self.array_index}.json"
         stage_state_path = root_dir_path / ".stage_states" / stage_state_basename
         
         if stage_info_path.exists():

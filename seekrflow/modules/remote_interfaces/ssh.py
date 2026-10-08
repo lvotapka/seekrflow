@@ -25,7 +25,6 @@ def submit_remote_workload_with_ssh(
         private_key_filename: str | None = None,
         private_key_passphrase: str | None = None,
         ) -> dict:
-    # TODO: convert manager_payload to args
     args = [manager_payload]
 
     connect_kwargs = {}

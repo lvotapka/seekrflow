@@ -5,6 +5,7 @@ Handle client run processes.
 """
 
 import os
+import math
 import time
 import json
 import fcntl
@@ -12,7 +13,6 @@ import signal
 import typing
 import asyncio
 import datetime
-import multiprocessing
 from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,6 +22,7 @@ from radical.asyncflow import WorkflowEngine, LocalExecutionBackend
 import seekr.modules.structures as seekr_structures
 import seekr.modules.scales.base as scales_base
 
+import seekrflow.modules.base as base
 import seekrflow.modules.structures as structures
 import seekrflow.modules.transfer.base as transfer_base
 import seekrflow.modules.client.structures as client_structures
@@ -37,11 +38,6 @@ SHUTDOWN_CANCEL_TIMEOUT = 30.0
 ENGINE_SHUTDOWN_TIMEOUT = 15.0
 REMOTE_STATUS_WRITE_INTERVAL = 15.0 # seconds
 
-# TODO: track consecutive empty job checks to avoid premature submission?
-        #   formerly: MAX_EMPTY_CHECKS_BEFORE_RESUBMIT = 10
-        # TODO: track quick failures (jobs that start running but fail within N cycles)
-        #   formerly: MIN_RUNNING_TIME_BEFORE_IDLE = 2 * MAIN_LOOP_INTERVAL
-
 async def _run_blocking(fn: typing.Callable[..., typing.Any], *args, **kwargs):
     """
     Run a blocking callable off the asyncio event loop (thread pool).
@@ -52,6 +48,16 @@ async def _run_blocking(fn: typing.Callable[..., typing.Any], *args, **kwargs):
     return await loop.run_in_executor(
         None, lambda: fn(*args, **kwargs))
 
+def _format_hms(seconds: float) -> str:
+    """
+    Convert seconds to a human-readable string in the format of HH:MM:SS.
+    """
+    whole = max(0, math.ceil(seconds))
+    hours, rem = divmod(whole, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def run_units_from_info(
         dimensions: list[dict],
         number_of_anchors: int,
@@ -60,33 +66,33 @@ def run_units_from_info(
     """
     Generate run units grid from dimensions and numbers of anchors and swarms.
     """
-    # Validate first
-    if "anchor" in dimensions:
-        if number_of_anchors <= 0:
-            raise ValueError(
-                "Dispatch dimension 'anchor' requires a positive num_anchors."
-                f"got {number_of_anchors}.")
+    if len(dimensions) == 0:
+        return [job_structures.RunUnit(anchor="any", swarm_id=None)]
+
     if "swarm" in dimensions:
         if number_of_swarms <= 1:
             raise ValueError(
                 f"Dispatch dimension 'swarm' requires num_swarms > 1, "
                 f"got {number_of_swarms}.")
     # Assign the grid of run units
-    if len(dimensions) == 0:
-        return [job_structures.RunUnit(anchor="any", swarm_id=None)]
-    
-    if dimensions == ["anchor"]:
-        return [
-            job_structures.RunUnit(anchor=anchor, swarm_id=None)
-            for anchor in range(number_of_anchors)
-        ]
-
     if dimensions == ["swarm"]:
         return [
             job_structures.RunUnit(anchor="any", swarm_id=swarm)
             for swarm in range(number_of_swarms)
         ]
 
+    if "anchor" in dimensions:
+        if (number_of_anchors is None) or (number_of_anchors <= 0):
+            raise ValueError(
+                "Dispatch dimension 'anchor' requires a positive num_anchors."
+                f"got {number_of_anchors}.")
+    
+    if dimensions == ["anchor"]:
+        return [
+            job_structures.RunUnit(anchor=anchor, swarm_id=None)
+            for anchor in range(number_of_anchors)
+        ]
+    
     if dimensions == ["anchor", "swarm"]:
         units: list[job_structures.RunUnit] = []
         for anchor in range(number_of_anchors):
@@ -107,7 +113,6 @@ class StageWorkflow:
     seekrflow: structures.Seekrflow = attrs.field(repr=False)
     stage_list: List[scales_base.Base_stage] = attrs.field(repr=False)
     workflow_engine: WorkflowEngine = attrs.field(repr=False)
-    #resource_name: str = attrs.field(default="local")
     resource: structures.Resource_base | None = attrs.field(repr=False)
     resolved_execution: structures.Resolved_execution | None = attrs.field(
         default=None, repr=False)
@@ -115,20 +120,19 @@ class StageWorkflow:
     benchmark_mode: Dict[str, bool] = attrs.field(factory=dict)
     
     # Derived / mutable state
-    dependency_indices: list[int] = attrs.field(factory=list)
     dependency_tasks: list = attrs.field(factory=list)
     task: typing.Any = attrs.field(default=None)
-    process: multiprocessing.Process | None = attrs.field(
-        default=None, repr=False)
-    stage_state: Dict[str, str] = attrs.field(
-        factory=dict)
-    #    default="unknown", validator=attrs.validators.in_(
-    #        {'unstarted', 'started', 'completed', 'error', 'unknown'}))
-    # TODO: get these filled out from the state
+    stage_state: Dict[str, str] = attrs.field(factory=dict)
     progress: Dict[str, dict[str, float]] = attrs.field(factory=dict)
-    elapsed_times: Dict[str, float] = attrs.field(factory=dict)
-    number_of_steps_completed: Dict[str, int] = attrs.field(factory=dict)
-    timestep_values: Dict[str, float] = attrs.field(factory=dict)
+    start_step: Dict[str, dict[str, int]] = attrs.field(factory=dict)
+    current_step: Dict[str, dict[str, int]] = attrs.field(factory=dict)
+    total_steps: Dict[str, dict[str, int]] = attrs.field(factory=dict)
+    time_of_first_progress: Dict[str, dict[str, float]] = attrs.field(factory=dict)
+    time_of_last_progress: Dict[str, dict[str, float]] = attrs.field(factory=dict)
+    # Accumulated steps and seconds over multiple jobs for a stage
+    accounted_steps: Dict[str, dict[str, float]] = attrs.field(factory=dict)
+    accounted_seconds: Dict[str, dict[str, float]] = attrs.field(factory=dict)
+    accounted_internal_id: Optional[int] = attrs.field(default=None)
 
     manager_status: str = attrs.field(
         default="idle", validator=attrs.validators.in_(
@@ -137,14 +141,11 @@ class StageWorkflow:
     semaphore: str = attrs.field(
         default="go", validator=attrs.validators.in_(
             {"go", "wait", "stop"}))
-    #job_ids: List[str] = attrs.field(factory=list)
-    #job_names: List[str] = attrs.field(factory=list)
     internal_id: Optional[int] = attrs.field(default=None)
     job_id: Optional[str] = attrs.field(default=None)
     job_name: Optional[str] = attrs.field(default=None)
     array_indices: Optional[List[int]] = attrs.field(default=None)
 
-    # TODO: move transfer-related attributes to a separate class?
     transfer_requested: bool = attrs.field(default=False)
     transfer_status: str = attrs.field(default="idle")
     transfer_direction: str | None = attrs.field(default=None)
@@ -152,62 +153,69 @@ class StageWorkflow:
     transfer_relaunch_count: int = attrs.field(default=0)
     transfer_from: str | None = attrs.field(default=None)
     last_error: str | None = attrs.field(default=None)
-    #last_raw_status: dict | None = attrs.field(default=None, repr=False)
-    running_start_time: float | None = attrs.field(default=None)
-    status_polled_at: float | None = attrs.field(default=None)
-    #co_schedule_with: str | None = attrs.field(default=None)
-    #fusion_host: str | None = attrs.field(default=None)
-    #fused_before: list[str] = attrs.field(factory=list)
-    #fused_after: list[str] = attrs.field(factory=list)
-    #peer_workflows: dict[str, "StageWorkflow"] = attrs.field(
-    #    factory=dict, repr=False)
-    #holds_local_slot: bool = attrs.field(default=False)
-    #local_slot_file: str | None = attrs.field(default=None, repr=False)
     telemetry_poll_interval: float | None = attrs.field(default=None)
     detached_requested: bool = attrs.field(default=False)
     control_file_semaphore: str | None = attrs.field(default=None, repr=False)
     
-    # TODO: work on this function and see whether it's even necessary
-    async def probe_launch(self) -> tuple[str, dict|None]:
+    async def probe_launch(self) -> str:
         """
         Probe for any running jobs for our stages and return the action and status.
         """
-        if self.resource is None: # Local resource
-            return "submit", None
-        stage_indices = [stage.index for stage in self.stage_list]
-        # TODO: figure out what to do if internal_id is None
         if self.internal_id is None:
-            # A fresh run probably
-            return "submit", None
-        # TODO: construct a manager_payload
+            return "submit"
+        root_dir = workload_remote_local.resolve_model_directory(
+            self.seekrflow, self.resource)
+        manager_payload = {
+            "system_payloads": {
+                self.seekrflow.name: {
+                    "root_dir": root_dir,
+                    "jobs": [
+                        {
+                            "internal_id": self.internal_id,
+                            "job_id": self.job_id,
+                            "job_name": self.job_name,
+                            "stage_indices": [stage.index for stage in self.stage_list],
+                            "array_indices": self.array_indices,
+                        },
+                    ],
+                },
+            }
+        }
+
         try:
-            resulting_payload = workload_remote_local.status(
-                resource=self.resource,
-                manager_payload=manager_payload,
-                silent=True
+            result = await _run_blocking(
+                workload_remote_local.status,
+                self.resource,
+                manager_payload,
+                silent=True,
             )
         except Exception as e:
             print(
-                f"[remote-probe] fused set member {stage_indices[0]}: "
-                f"probe failed ({e}); not submitting until state "
-                f"can be read"
+                f"[remote-probe] stage {self.stage_list[0].name}: "
+                f"probe failed ({e}); not submitting until state can be read"
             )
             if self.job_id is not None:
-                return "reattach", None
-            return "defer", None
+                return "reattach"
+            return "defer"
 
-        # See if any jobs exist in the manager status
-        self.job_id = member_statuses.get("manager_state", {}).get("last_known_jobs", None)
-        if self.job_id is not None:
-            return "reattach", None
-        completed = True
-        for stage_state_dict in member_statuses.get("stage_state_dicts", {}):
-            if not stage_state_dict.get("finished", False):
-                completed = False
-                break
-        if completed:
-            return "completed", member_statuses
-        return "submit", member_statuses
+        job_dict = (
+            (result.get("payload") or {})
+            .get(self.seekrflow.name, {})
+            .get(self.job_id)
+        )
+        if not job_dict:
+            return "submit"
+        self.apply_stage_dicts(job_dict.get("stage_dicts_by_stage_index") or {})
+        states = {
+            entry.get("state")
+            for entry in (job_dict.get("manager_dicts_by_array_index", {}).values())
+        }
+        if states & {"running", "queued", "pending"}:
+            return "reattach"
+        stage_dicts = job_dict.get("stage_dicts_by_stage_index") or {}
+        if stage_dicts and all(entry.get("finished") for entry in stage_dicts.values()):
+            return "completed"
+        return "submit"
         
     def _outbound_transfer_resources(self):
         """
@@ -222,22 +230,113 @@ class StageWorkflow:
             self.transfer_from)
         return src_resource, self.resource
 
-    def _compute_submit_time_limit_override(self) -> str | None:
+    def _fold_latest_job(self) -> None:
+        """Add this internal_id's steps and seconds once."""
+        if self.internal_id is None or self.internal_id == self.accounted_internal_id:
+            return
+        for stage in self.stage_list:
+            name = stage.name
+            starts = self.start_step.get(name) or {}
+            currents = self.current_step.get(name) or {}
+            firsts = self.time_of_first_progress.get(name) or {}
+            lasts = self.time_of_last_progress.get(name) or {}
+            step_dest = self.accounted_steps.setdefault(name, {})
+            time_dest = self.accounted_seconds.setdefault(name, {})
+            for key, current in currents.items():
+                start = starts.get(key)
+                t0 = firsts.get(key)
+                t1 = lasts.get(key)
+                if start is None or t0 is None or t1 is None:
+                    continue
+                steps = current - start
+                elapsed = t1 - t0
+                if steps > 0 and elapsed > 0:
+                    step_dest[key] = step_dest.get(key, 0) + steps
+                    time_dest[key] = time_dest.get(key, 0) + elapsed
+        self.accounted_internal_id = self.internal_id
+    
+    def _hint_rate_per_second(
+            self, 
+            stage, 
+            hint: float
+            ) -> float | None:
         """
-        Determine the time string in "HH:MM:SS" for the time limit override.
+        Account for the estimated_performance is in ns/day for MD and 
+        trajectories/day for BD.
         """
-        stage_names = [stage.name for stage in self.stage_list]
-        # If time policy is fixed or not set, return None, which means no override.
+        kind = getattr(stage, "scale_type", None)
+        per_day = hint
+        if kind == "molecular_dynamics":
+            try:
+                timestep_ps = self.model.get_timestep_by_type(kind)
+            except (ValueError, AssertionError):
+                return None
+            if not timestep_ps:
+                return None
+            per_day *= 1000.0 / timestep_ps  # ns/day → steps/day
+        elif kind != "brownian_dynamics":
+            return None
+        return per_day / 86400.0
+
+    def _compute_submit_time_limit_override(
+            self,
+            units_grid: list,
+            group_size: int | None,
+            concurrency: int | None,
+            ) -> str | None:
         if self.resolved_execution is None:
             return None
+        if any(self.benchmark_mode.values()):
+            # TODO: the only problem here is that there might be a benchmark on a
+            # later stage in the list, which will need a longer time limit.
+            return base.BENCHMARK_REMOTE_TIME_LIMIT
         policy = self.resolved_execution.time_policy
-        if isinstance(policy, structures.Time_policy_fixed):
+        if not isinstance(policy, structures.Time_policy_adaptive):
             return None
-        else:
-            raise NotImplementedError(f"Time policy {policy} not yet implemented.")
-        # TODO: need to figure out how to implement the time limit override
-        # for the adaptive time policy.
-        
+        self._fold_latest_job()
+        unit_seconds: list[float] = []
+        for unit in units_grid:
+            key = f"anchor_{unit.anchor}_swarm_{unit.swarm_id}"
+            seconds = 0.0
+            for stage in self.stage_list:
+                name = stage.name
+                total = (self.total_steps.get(name) or {}).get(key)
+                current = (self.current_step.get(name) or {}).get(key, 0)
+                done = (self.accounted_steps.get(name) or {}).get(key)
+                elapsed = (self.accounted_seconds.get(name) or {}).get(key)
+                if total is None:
+                    return None
+                remaining = max(0, total - current)
+                if remaining == 0:
+                    continue
+                if done and elapsed:
+                    rate = done / elapsed
+                else:
+                    if policy.estimated_performance is None:
+                        return None
+                    rate = self._hint_rate_per_second(stage, policy.estimated_performance)
+                    if rate is None:
+                        return None
+                seconds += remaining / rate
+            unit_seconds.append(seconds)
+        if not unit_seconds:
+            return None
+        width = concurrency or 1
+        size = group_size or len(unit_seconds)
+        member_times = []
+        for start in range(0, len(unit_seconds), size):
+            chunk = unit_seconds[start:start + size]
+            member = 0.0
+            for wave in range(0, len(chunk), width):
+                member += max(chunk[wave:wave + width])
+            member_times.append(member)
+        seconds = max(member_times) * (1.0 + policy.safety_factor)
+        cap_text = policy.max_time_limit or getattr(self.resource, "max_time_limit", None)
+        if cap_text is not None:
+            seconds = min(seconds, client_validation.time_limit_to_seconds(cap_text))
+        if policy.min_time_limit is not None:
+            seconds = max(seconds, client_validation.time_limit_to_seconds(policy.min_time_limit))
+        return _format_hms(seconds)
 
     def move_files(
             self,
@@ -261,6 +360,7 @@ class StageWorkflow:
             return
         self.transfer_status = "running"
         self.transfer_direction = "in" if backwards else "out"
+        prior_status = self.manager_status
         self.manager_status = "pulling" if backwards else "pushing"
         try:
             for resource, pull in steps:
@@ -279,13 +379,44 @@ class StageWorkflow:
 
         self.transfer_status = "completed"
         self.transfer_direction = None
-        self.manager_status = "idle"
+        self.manager_status = prior_status if backwards else "idle"
         self.transfer_relaunch_count = 0
+
+    def apply_stage_dicts(
+            self, 
+            stage_dicts: dict
+            ) -> None:
+        """
+        Copy one status payload onto this workflow.
+        """
+        series = (
+            ("stage_anchor_swarm_progress_list", self.progress),
+            ("stage_anchor_swarm_starting_step_list", self.start_step),
+            ("stage_anchor_swarm_current_step_list", self.current_step),
+            ("stage_anchor_swarm_total_steps_list", self.total_steps),
+            ("stage_anchor_swarm_time_of_first_progress_list", self.time_of_first_progress),
+            ("stage_anchor_swarm_time_of_last_progress_list", self.time_of_last_progress),
+        )
+        for stage in self.stage_list:
+            stage_dict = stage_dicts.get(stage.index)
+            if stage_dict is None:
+                stage_dict = stage_dicts.get(str(stage.index))
+            if not stage_dict:
+                continue
+            self.stage_state[stage.name] = stage_dict.get("state", "unknown")
+            for field, destination in series:
+                per_swarm = {}
+                for row in stage_dict.get(field) or []:
+                    key_stage_index, key_anchor, key_swarm_id, value = row
+                    if key_stage_index == stage.index:
+                        per_swarm[f"anchor_{key_anchor}_swarm_{key_swarm_id}"] = value
+                destination[stage.name] = per_swarm
         
     async def create_tasks(self) -> None:
         """
         Register tasks for running this stage_workflow.
         """
+        self.manager_status = "queued"
         # Transfer files if dependent stage resource is different
         @self.workflow_engine.function_task
         async def transfer_files(*args):
@@ -312,68 +443,42 @@ class StageWorkflow:
         @self.workflow_engine.function_task
         async def run_stage(*args):
             stage_names = [stage.name for stage in self.stage_list]
-            # TODO: idea goal: don't even distinguish between local and remote here
-            # let the 'remote' interface combined with the workload manager handle it.
-            # For instance, local would be the 'local_shell' interface combined with the
-            # multiprocessing workload manager.
-            """
-            if self.resource_name == "local":
-                force_overwrite_now = self.force_overwrite
-                if self.force_overwrite:
-                    workload_local_mp.kill_existing_local_stage_processes(
-                        self.stage.name, self.model.directory)
-                    # Force-rerun is a one-shot request.
-                    self.force_overwrite = False
-                existing_state = workload_local_mp\
-                    .check_for_existing_local_processes(
-                        self.model.directory, self.stage.name)
-                if existing_state and not force_overwrite_now:
-                    # Note: We can't truly "reattach" to a multiprocessing.Process object,
-                    # but we can track the PID and monitor/kill it via the state file
-                    print(f"  Reattached to {self.stage.name} process "
-                          f"(PID: {existing_state.pid})")
-                else:
-                    # TODO: construct job_spec and run it locally
-                    self.process = multiprocessing.Process(
-                        target=workload_local_mp.run_locally,
-                        args=(self.model.directory, self.stage.name,),
-                        kwargs={
-                            "force_overwrite": force_overwrite_now,
-                            "benchmark_mode": self.benchmark_mode,
-                        },
-                    )
-                    self.process.start()
-            """
-
-            #else: # remote
             if self.resource is None:
                 raise Exception(
                     f"Remote resource config missing for {self.resource.name!r}")
             try:
                 remote_or_cloud = workload_remote_local.resource_kind(
                     self.resource)
-                destination_path = None
-                destination_model_filename = None
-                if remote_or_cloud == "remote":
-                    destination_path = (
-                        workload_remote_local.resolve_model_directory(
-                            self.seekrflow, self.resource))
-                    destination_model_filename = os.path.join(
-                        destination_path, "model.json")
+                #if remote_or_cloud == "remote":
+                destination_path = (
+                    workload_remote_local.resolve_model_directory(
+                        self.seekrflow, self.resource))
+                destination_model_filename = os.path.join(
+                    destination_path, "model.json")
 
-                # Apply force overwrite to these stages
+                # If any stage is force-overwrite, cancel the whole job
                 for stage_name, force_now in self.force_overwrite.items():
-                    if force_now:
-                        workload_remote_local.cancel_and_reset_stage(
-                            self.seekrflow,
-                            stage_names,
-                            self.job_id,
-                            self.job_name,
-                            model_directory=self.model.directory,
+                    if force_now and self.job_id is not None:
+                        manager_payload = {
+                            "remove_json_files": False,
+                            "system_payloads": {
+                                self.seekrflow.name: {
+                                    "root_dir": destination_path,
+                                    "jobs": [
+                                        {
+                                            "job_id": self.job_id,
+                                            "job_name": self.job_name,
+                                        },
+                                    ],
+                                },
+                            },
+                        }
+                        workload_remote_local.submit_cancel_workload(
+                            self.resource,
+                            manager_payload,
+                            silent=True,
                         )
-                        for stage_name2 in stage_names:
-                            self.force_overwrite[stage_name2] = False
-                        # If any stage is force-overwritten, kill the entire job.
+                        self.job_id = None
                         break
 
                 # prepare stage specs, run units, and job spec
@@ -386,8 +491,11 @@ class StageWorkflow:
                         benchmark=self.benchmark_mode[stage.name],
                     )
                     stage_specs.append(stage_spec)
+                
+                force_any = any(self.force_overwrite.values())
+                for stage_name in self.force_overwrite:
+                    self.force_overwrite[stage_name] = False
 
-                # TODO: how are we going to handle run units?
                 dispatch = (
                     self.resolved_execution.dispatch \
                         if self.resolved_execution is not None else None)
@@ -395,10 +503,22 @@ class StageWorkflow:
                 group_size = dispatch.group_size if dispatch is not None else None
                 concurrency = dispatch.concurrency if dispatch is not None else None
                 
-                number_of_anchors = 100 # TODO: assign from previous stage
-                number_of_swarms = 100 # TODO: assign from previous stage
+                if bool(dimensions):
+                    # Unit enumeration is needed.
+                    unit_counts = workload_remote_local.fetch_unit_counts(
+                        self.seekrflow,
+                        self.stage_list[0],
+                        self.resource,
+                        silent=True,
+                    )
+                    number_of_anchors = unit_counts.num_anchors
+                    number_of_swarms = unit_counts.num_swarms
+                else:
+                    number_of_anchors = 0
+                    number_of_swarms = 1
                 
-                units_grid = run_units_from_info(dimensions, number_of_anchors, number_of_swarms)
+                units_grid = run_units_from_info(
+                    dimensions or [], number_of_anchors, number_of_swarms)
                 size = group_size or len(units_grid)
                 array_size = 0
                 job_specs = []
@@ -421,47 +541,22 @@ class StageWorkflow:
                     job_specs.append(job_spec)
                     array_size += 1
 
-                # Determine effective walltime:
-                #   - benchmark mode: short fixed cap
-                #   - else: adaptive/fixed time_policy estimate
-                """ # TODO: implement time limit overrides eventually
-                time_limit_override = None
-                anchor_times_for_submit = None
-                if self.benchmark_mode:
-                    time_limit_override = (
-                        base.BENCHMARK_REMOTE_TIME_LIMIT)
-                    print(
-                        f"[seekr-time] stage {self.stage.name}: "
-                        f"benchmark mode -> requesting "
-                        f"{time_limit_override}"
-                    )
-                else:
-                    time_limit_override = self._compute_submit_time_limit_override()
-                    if time_limit_override is not None:
-                        print(
-                            f"[seekr-time] stage {self.stage.name}: "
-                            f"requesting {time_limit_override}"
-                        )
-                """
                 # Retrieve existing jobs, if any
-                # TODO: revisit this
-                if (not any(self.force_overwrite.values())) \
-                        and (self.job_id is not None or any(self.progress.values() > 0)):
+                if not force_any:
                     # If our stages have been run (or running), and no force overwrite,
-                    pre_action, pre_status = (
-                        await self.probe_launch())
-                    if pre_action != "submit":
-                        print(
-                            f"[remote-submit] stage {self.stage_list[0].name}: "
-                            f"aborting sbatch; probe={pre_action} "
-                            "(live jobs or inconclusive squeue)"
-                        )
-                        if pre_action == "completed":
-                            #self.stage_state = "completed" # TODO: set all members to completed
-                            self.progress = 1.0
-                            return
-                        self.job_id = pre_status.get("manager_state", {}).get("last_known_jobs", None)
-                        return "reattach", pre_status
+                    pre_action = await self.probe_launch()
+                    if pre_action == "completed":
+                        for stage in self.stage_list:
+                            self.stage_state[stage.name] = "completed"
+                        return
+                    if pre_action == "reattach":
+                        self.manager_status = "running"
+                        return
+                    if pre_action == "defer":
+                        return
+
+                time_limit_override = self._compute_submit_time_limit_override(
+                    units_grid, group_size, concurrency)
 
                 # Finally, submit the job
                 run_result = await _run_blocking(
@@ -471,6 +566,7 @@ class StageWorkflow:
                     stage_names,
                     job_specs,
                     self.resolved_execution,
+                    time_limit_override,
                 )
                 if not isinstance(run_result, dict):
                     raise RuntimeError(
@@ -493,12 +589,12 @@ class StageWorkflow:
                 self.internal_id = internal_id
                 self.job_id = job_id
                 self.job_name = job_name
+                self.manager_status = "queued"
                     
             except Exception as e:
                 for stage_name in stage_names:
                     self.stage_state[stage_name] = "error"
                 self.last_error = f"remote submit failed: {e}"
-                # TODO: update control file here to set semaphore=wait
                 self.control_file_semaphore = "wait"
                 self.semaphore = "wait"
                 self.manager_status = "failed"
@@ -525,9 +621,7 @@ class StageWorkflow:
         Monitor for transfer requests.
         """
         while True:
-            if self.detached_requested:
-                break
-            if self.semaphore == "stop":
+            if self.detached_requested or self.semaphore == "stop" or self.is_terminal():
                 break
             if self.transfer_requested:
                 self.transfer_requested = False
@@ -541,12 +635,6 @@ class StageWorkflow:
         state.
         """
         process_info = None
-        if self.process is not None:
-            process_info = {
-                "pid": self.process.pid,
-                "alive": self.process.is_alive(),
-                "exitcode": self.process.exitcode,
-            }
         stages = {}
         for stage in self.stage_list:
             stages[stage.name] = {
@@ -561,14 +649,11 @@ class StageWorkflow:
         return {
             "resource_name": self.resource.name if self.resource is not None else "local",
             "manager_status": self.manager_status,
-            "dependency_indices": self.dependency_indices,
             "transfer_status": self.transfer_status,
             "transfer_direction": self.transfer_direction,
             "transfer_error": self.transfer_error,
             "transfer_relaunch_count": self.transfer_relaunch_count,
-            "status_polled_at": self.status_polled_at,
-            "running_start_time": self.running_start_time,
-            "process": process_info,
+            "last_error": self.last_error,
             "internal_id": self.internal_id,
             "job_id": self.job_id,
             "job_name": self.job_name,
@@ -583,25 +668,47 @@ class StageWorkflow:
         """
         self.semaphore = "stop"
         self.manager_status = "idle"
-        # TODO: cancel local processes and remote jobs - handle this in a 
-        #  more general way that works for both local and remote.
-        return
+        if self.resource is None or self.job_id is None:
+            return
+        root_dir = workload_remote_local.resolve_model_directory(
+            self.seekrflow, self.resource)
+        manager_payload = {
+            "remove_json_files": False,
+            "system_payloads": {
+                self.seekrflow.name: {
+                    "root_dir": root_dir,
+                    "jobs": [
+                        {
+                            "job_id": self.job_id,
+                            "job_name": self.job_name,
+                        },
+                    ],
+                },
+            },
+        }
+        try:
+            workload_remote_local.submit_cancel_workload(
+                self.resource, manager_payload, silent=True)
+        except Exception as error:
+            print(f"[cancel] stage {self.stage_list[0].name}: {error}")
+            return
+        self.job_id = None
 
     def has_running_task_or_process(self) -> bool:
         """
         Check if this stage has any running tasks or processes.
         """
-        # TODO: see if the process is actually still running.
-        return self.task is not None \
-            or self.process is not None
+        return self.manager_status in {"running", "queued", "queued/running"}
 
     def is_terminal(self) -> bool:
         """
         Check if this stage is terminal.
         """
-        if self.semaphore == "stop" and not self.has_running_task_or_process():
+        if self.stage_list and all(
+                self.stage_state.get(stage.name) == "completed"
+                for stage in self.stage_list):
             return True
-        if all(stage_state == "completed" for stage_state in self.stage_state.values()):
+        if self.semaphore == "stop" and not self.has_running_task_or_process():
             return True
         return False
 
@@ -609,8 +716,6 @@ def _link_to_previous(prev_resolved, cur_resolved) -> bool:
     """
     Check if the current stage is linked to the previous stage.
     """
-    if prev_resolved is None or cur_resolved is None:
-        return False
     if cur_resolved.co_schedule_with == "predecessor":
         return True
     if prev_resolved.co_schedule_with == "successor":
@@ -627,33 +732,15 @@ class SeekrPipeline:
     workflow_engine: WorkflowEngine = attrs.field(repr=False)
     
     # Derived / mutable state
-    # TODO: store stage_names and tasks within the stage workflows?
-    #   Make obtaining them a method?
-    #stage_names: list[str] = attrs.field(factory=list)
     stage_workflows: list[StageWorkflow] \
         = attrs.field(factory=list, repr=False)
     stage_tasks: list = attrs.field(factory=list, repr=False)
-    task_id_to_stage: dict = attrs.field(factory=dict, repr=False)
-    telemetry: typing.Any = attrs.field(default=None, repr=False)
-    #force_rerun_stages: set[str] = attrs.field(factory=set)
-    #semaphore_overrides: dict[str, str] = attrs.field(factory=dict)
-    #benchmark_stage: str | None = attrs.field(default=None)
-    #keystrokes_enabled: bool = attrs.field(default=True)
-    #batch_child_mode: bool = attrs.field(default=False)
-    #local_slot_file: str | None = attrs.field(default=None)
-    #orphan_detach: bool = attrs.field(default=True)
-    #_input_buffer: str = attrs.field(default="", repr=False)
-    _live_display: typing.Any = attrs.field(default=None, repr=False)
     detached_requested: bool = attrs.field(default=False, repr=False)
     shutting_down: bool = attrs.field(default=False, repr=False)
     _shutdown_task: asyncio.Task | None = attrs.field(
         default=None, repr=False)
     _stop_event: asyncio.Event | None = attrs.field(
         default=None, repr=False)
-    #_batch_commands_offset: int = attrs.field(default=0, repr=False)
-    #_foreign_writer_warned: bool = attrs.field(default=False, repr=False)
-    #_hard_exit_armed: bool = attrs.field(default=False, repr=False)
-    #_orphaned_since: float | None = attrs.field(default=None, repr=False)
     
     def __attrs_post_init__(
             self, 
@@ -664,12 +751,9 @@ class SeekrPipeline:
         current: List[scales_base.Base_stage] = []
         current_resolved: List[structures.Resolved_execution] = []
         for stage in self.systemrun.model.stages:
-            try:
-                resolved = client_validation.resolve_stage_execution(
-                    self.systemrun.seekrflow.run_settings, stage.name, 
-                    self.systemrun.seekrflow.workflow.procedure)
-            except ValueError:
-                resolved = None
+            resolved = client_validation.resolve_stage_execution(
+                self.systemrun.seekrflow.run_settings, stage.name, 
+                self.systemrun.seekrflow.workflow.procedure)
             if current and _link_to_previous(prev_resolved, resolved):
                 current.append(stage)
                 current_resolved.append(resolved)
@@ -698,27 +782,20 @@ class SeekrPipeline:
         """
         Add a seekr stage to the pipeline.
         """
-        group_resource_name = None
-        resource = None
+        group_resource = None
         for resolved in resolved_list:
-            resource_name = "local" if resolved is None else resolved.resource_name
-            if resource_name == "local":
-                resource = None
-            else:
-                resource = self.systemrun.seekrflow.run_settings.get_resource_by_name(resource_name)
-            if group_resource_name is None:
-                group_resource_name = resource_name
-            elif group_resource_name != resource_name:
+            resource = resolved.resource
+            if group_resource is None:
+                group_resource = resource
+            elif group_resource.name != resource.name:
                 raise ValueError(
                     f"All stages in a group must have the same resource: "\
-                    f"{group_resource_name} != {resource_name}")
+                    f"{group_resource.name} != {resource.name}")
         stage_workflow = StageWorkflow(
-            self.systemrun.model, self.systemrun.seekrflow, stage_list, self.workflow_engine, resource)
-        #TODO: handle telemetry_poll_interval
-        if resolved is not None:
-            stage_workflow.resolved_execution = resolved
-            if resolved.resource is not None:
-                stage_workflow.resource = resolved.resource
+            self.systemrun.model, self.systemrun.seekrflow, stage_list, self.workflow_engine, 
+            resource)
+        stage_workflow.telemetry_poll_interval = self.systemrun.telemetry_poll_interval
+        stage_workflow.resolved_execution = resolved
         stage_workflow_semaphore = None
         for stage in stage_list:
             stage_workflow.force_overwrite[stage.name] \
@@ -873,7 +950,6 @@ class SeekrPipeline:
                         return False
             return True
 
-        # TODO: these become session-level, not system level
         stop_event = asyncio.Event()
         self._stop_event = stop_event
         try:
@@ -913,7 +989,6 @@ class SeekrPipeline:
                             and stage_workflow.semaphore == "go":
                         # Nothing is currently running:
                         # (Re)launch stage when permitted by semaphore and deps.
-                        stage_workflow.dependency_indices = []
                         stage_workflow.dependency_tasks = []
                         stage_workflow.tasks = {stage.name:None for stage \
                             in stage_workflow.stage_list}
@@ -923,37 +998,19 @@ class SeekrPipeline:
 
                         # Transfer from remote if necessary
                         upstream_idx = getattr(
-                            stage_workflow.stage, "input_stage_index", 0)
+                            stage_workflow.stage_list[0], "input_stage_index", 0)
                         stage_workflow.transfer_from = None
                         if upstream_idx and upstream_idx > 0:
                             upstream_sw = next(
                                 (sw for sw in self.stage_workflows
-                                 if sw.stage.index == upstream_idx),
+                                 if sw.stage_list[0].index == upstream_idx),
                                 None,
                             )
                             if (upstream_sw is not None
-                                    and upstream_sw.resource_name
-                                    != stage_workflow.resource_name):
+                                    and upstream_sw.resource.name
+                                    != stage_workflow.resource.name):
                                 stage_workflow.transfer_from = \
-                                    upstream_sw.resource_name
-
-                        # Handle remote jobs
-                        #   Launch a probe to determine what to do with the remote job
-                        #      
-                        #   Handle force-overwrite for the probe
-                        #   Skip the probe if force_overwrite is True
-                        #   If not skipping the probe:
-                        #     decide whether to resume a probe
-                        #   Depending on what the probe returns:
-                        #     if "completed", set stage_workflows.state to "completed"
-                        #       and full progress.
-                        #     if "defer", set stage_workflow to "queued" and continue
-                        #     if "reattach", get the manager status from probe
-                        #       update status_polled_at, create monitor-only task,
-                        #       and add it to launched_tasks and to self.stage_tasks
-                        # Handle local jobs
-                        #   check for any existing local processes.
-                        #   based on this, set starting states and managers.
+                                    upstream_sw.resource.name
 
                         await stage_workflow.create_tasks()
                         if len(stage_workflow.tasks) > 0:
@@ -1015,23 +1072,20 @@ async def monitor_session_pipelines(
             for sw in pipeline.stage_workflows:
                 if sw.internal_id is None:
                     continue
-                if sw.resource is None:
-                    resource_name = "local"
-                    root_directory = sw.model.directory
-                else:
-                    resource_name = sw.resource.name
-                    root_directory = os.path.join(
-                        sw.resource.remote_working_directory, sw.seekrflow.name)
+                
+                resource_name = sw.resource.name
+                root_directory = workload_remote_local.resolve_model_directory(
+                        sw.seekrflow, sw.resource)
 
                 if resource_name not in resource_dict:
                     resource_dict[resource_name] = sw.resource
                 if resource_name not in status_payloads_by_resource:
-                    status_payloads_by_resource[resource_name] = {}
-                if system_name not in status_payloads_by_resource[resource_name]:
-                    status_payloads_by_resource[resource_name][system_name] = {}
-                    status_payloads_by_resource[resource_name][system_name]["root_dir"] \
+                    status_payloads_by_resource[resource_name] = {"system_payloads": {}}
+                if system_name not in status_payloads_by_resource[resource_name]["system_payloads"]:
+                    status_payloads_by_resource[resource_name]["system_payloads"][system_name] = {}
+                    status_payloads_by_resource[resource_name]["system_payloads"][system_name]["root_dir"] \
                         = root_directory
-                    status_payloads_by_resource[resource_name][system_name]["jobs"] = []
+                    status_payloads_by_resource[resource_name]["system_payloads"][system_name]["jobs"] = []
 
                 job_dict = {}
                 job_dict["internal_id"] = sw.internal_id
@@ -1039,8 +1093,8 @@ async def monitor_session_pipelines(
                 job_dict["job_name"] = sw.job_name
                 job_dict["stage_indices"] = [stage.index for stage in sw.stage_list]
                 job_dict["array_indices"] = sw.array_indices
-                status_payloads_by_resource[resource_name][system_name]["jobs"]\
-                    .append(job_dict)
+                status_payloads_by_resource[resource_name]["system_payloads"]\
+                    [system_name]["jobs"].append(job_dict)
 
         for resource_name, payload in status_payloads_by_resource.items():
             resource = resource_dict[resource_name]
@@ -1069,42 +1123,27 @@ async def monitor_session_pipelines(
                         job_dict = system_payload.get(sw.job_id, None)
                         if job_dict is None:
                             continue
-                        slurm_dicts_by_array_index = job_dict["slurm_dicts_by_array_index"]
-                        slurm_state_set = set()
-                        for array_index, slurm_dict in slurm_dicts_by_array_index.items():
-                            slurm_state_set.add(slurm_dict["state"])
-                            #slurm_last_known_elapsed = slurm_dict["last_known_elapsed"]
-                            #slurm_last_known_jobs = slurm_dict["last_known_jobs"]
-                        if len(slurm_state_set) == 0:
+                        manager_dicts_by_array_index = job_dict["manager_dicts_by_array_index"]
+                        manager_state_set = set()
+                        for array_index, manager_dict in manager_dicts_by_array_index.items():
+                            manager_state_set.add(manager_dict["state"])
+                            
+                        if len(manager_state_set) == 0:
                             sw.manager_status = "idle"
                         else:
-                            if "running" in slurm_state_set and (("queued" in slurm_state_set) or ("pending" in slurm_state_set)):
+                            if "running" in manager_state_set and (("queued" in manager_state_set) \
+                                    or ("pending" in manager_state_set)):
                                 sw.manager_status = "queued/running"
-                            elif "running" in slurm_state_set:
+                            elif "running" in manager_state_set:
                                 sw.manager_status = "running"
-                            elif ("queued" in slurm_state_set) or ("pending" in slurm_state_set):
+                            elif ("queued" in manager_state_set) or ("pending" in manager_state_set):
                                 sw.manager_status = "queued"
                             else:
                                 sw.manager_status = "idle"
 
                         stage_dicts_by_stage_index = job_dict["stage_dicts_by_stage_index"]
-                        for stage in sw.stage_list:
-                            stage_index = stage.index
-                            stage_dict = stage_dicts_by_stage_index.get(stage_index, None)
-                            if stage_dict is None:
-                                continue
-                            stage_state = stage_dict["state"]
-                            stage_finished = stage_dict["finished"]
-                            stage_anchor_swarm_progress_list \
-                                = stage_dict["stage_anchor_swarm_progress_list"]
-                            sw.stage_state[stage.name] = stage_state
-                            sw.progress[stage.name] = {}
-                            if stage_anchor_swarm_progress_list is not None:
-                                for key in stage_anchor_swarm_progress_list:
-                                    key_stage_index, key_anchor, key_swarm_id, progress = key
-                                    progress_key = f"anchor_{key_anchor}_swarm_{key_swarm_id}"
-                                    if key_stage_index == stage_index:
-                                        sw.progress[stage.name][progress_key] = progress
+                        sw.apply_stage_dicts(stage_dicts_by_stage_index)
+
         if ran_nothing:
             stop = True
             return
@@ -1169,7 +1208,6 @@ async def control_file_reader_loop(
                         pipeline.detached_requested = True
                     for sw in pipeline.stage_workflows:
                         stage_workflow_control = system_control["stage_workflows"][sw.stage_list[0].name]
-                        #sw.semaphore = stage_workflow_control["semaphore"]
                         transfer = stage_workflow_control["transfer"]
                         if transfer and not sw.transfer_requested and sw.transfer_status != "running":
                             sw.transfer_requested = True
@@ -1231,6 +1269,35 @@ def initialize_control_file(
             fcntl.flock(lockf, fcntl.LOCK_UN)
     return
 
+def restore_prior_jobs(
+        workflows: list, 
+        output_file: str
+        ) -> None:
+    """
+    Restore job identity from the last status snapshot if a previous session was 
+    interrupted.
+    """
+    try:
+        with open(output_file) as f:
+            session_statuses = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    by_stages = {}
+    for system_name, system_status in session_statuses.items():
+        for sw_status in (system_status.get("stage_workflows") or {}).values():
+            names = frozenset((sw_status.get("stages") or {}))
+            if names and sw_status.get("internal_id") is not None:
+                by_stages[(system_name, names)] = sw_status
+    for sw in workflows:
+        names = frozenset(stage.name for stage in sw.stage_list)
+        prior = by_stages.get((sw.seekrflow.name, names))
+        if prior is None:
+            continue
+        sw.internal_id = prior["internal_id"]
+        sw.job_id = prior.get("job_id")
+        sw.job_name = prior.get("job_name")
+        sw.array_indices = prior.get("array_indices") or []
+
 async def launch_session_pipelines(
         session: client_structures.RunSession,
         ) -> None:
@@ -1243,6 +1310,10 @@ async def launch_session_pipelines(
         for systemrun in session.systemrun_objects
     ]
     initialize_control_file(session.control_file, pipelines)
+    restore_prior_jobs(
+        [sw for pipeline in pipelines for sw in pipeline.stage_workflows],
+        session.output_file,
+    )
     try:
         await asyncio.gather(
             control_file_reader_loop(session.control_file, pipelines),

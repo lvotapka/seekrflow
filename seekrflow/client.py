@@ -19,6 +19,7 @@ import seekrflow.modules.client.structures as client_structures
 import seekrflow.modules.client.start as client_start
 import seekrflow.modules.client.validation as client_validation
 import seekrflow.modules.client.run as client_run
+import seekrflow.modules.client.status_and_cancel as client_status_and_cancel
 
 def client(
         batch: client_structures.Batch,
@@ -68,18 +69,17 @@ def client(
     if instruction == "run":
         asyncio.run(client_run.launch_session_pipelines(session))
         perform_final_transfer = True
-    #elif instruction == "status": # TODO: implement
-    #    client_run.get_session_status(session)
-    #    perform_final_transfer = False
-    #elif instruction == "stop": # TODO: implement
-    #    client_run.stop_session_pipelines(session)
-    #    perform_final_transfer = False
-    # TODO: add a "none" instruction? Or "transfer"?
+    elif instruction == "status":
+        client_status_and_cancel.report_detached_status(session)
+    elif instruction == "stop":
+        client_status_and_cancel.stop_detached_jobs(session)
     else:
         raise ValueError(f"Unknown instruction: {instruction!r}")
     
     if perform_final_transfer:
         for systemrun in session.systemrun_objects:
+            seekrflow, model = systemrun.seekrflow, systemrun.model
+            all_stage_names = [s.name for s in model.stages]
             transfer_stages_this_system = all_stage_names
             transferred_resources = client_start.transfer_unique_stage_resources(
                 seekrflow, transfer_stages_this_system, backwards=True)

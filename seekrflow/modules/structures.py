@@ -4,9 +4,6 @@ modules/structures.py
 Contain data structure classes used for seekrflow parameters/inputs.
 """
 
-# TODO: clean up this file - it should only contain data structures, not
-#   algorithms or functions
-
 import os
 import json
 import glob
@@ -203,56 +200,7 @@ class Transfer_settings_none(Transfer_settings_base):
     """
     type: typing.Literal["none"] = "none"
 
-@define
-class Resource_base:
-    """
-    Base class for resources.
-    """
-    type: typing.Literal["base"] = "base"
-    
-
-@define
-class Resource_local(Resource_base):
-    """
-    Local resource for running the protocol.
-    """
-    type: typing.Literal["local"] = "local"
-    remote_working_directory: str = field(
-        default="",
-        validator=validators.instance_of(str),
-        )
-    cpus_per_task: int = field(
-        default=1,
-        validator=validators.instance_of(int),
-    )
-    mps: int = field(
-        default=1,
-        validator=validators.instance_of(int),
-    )
-    remote_interface: (
-        Remote_interface_globus_compute_sdk
-        | Remote_interface_ssh
-        | Remote_interface_local_shell
-    ) = field(
-        default=Factory(Remote_interface_globus_compute_sdk),
-    )
-    transfer_settings: (
-        Transfer_settings_rsync
-        | Transfer_settings_globus
-        | Transfer_settings_none
-    ) = field(
-        default=Factory(Transfer_settings_globus),
-    )
-
-@define
-class Resource_remote_base(Resource_base):
-    """
-    Base class for remote resources.
-    """
-    pass
-
-# TODO: review to see if necessary or better placed elsewhere.
-def _validate_local_shell_transfer_none(resource: Resource_remote_base) -> None:
+def _validate_local_shell_transfer_none(resource: "Resource_remote_base") -> None:
     """local_shell requires transfer_settings.type == 'none'."""
     remote_interface = getattr(resource, "remote_interface", None)
     transfer_settings = getattr(resource, "transfer_settings", None)
@@ -265,6 +213,72 @@ def _validate_local_shell_transfer_none(resource: Resource_remote_base) -> None:
             f"type is {transfer_settings.type!r}; must be 'none'."
         )
 
+@define
+class Resource_base:
+    """
+    Base class for resources.
+    """
+    type: typing.Literal["base"] = "base"
+    
+
+@define
+class Resource_direct(Resource_base):
+    """
+    Local resource for running the protocol.
+    """
+    type: typing.Literal["direct"] = "direct"
+    name: str = field(
+        default="",
+        validator=validators.instance_of(str),
+    )
+    remote_working_directory: str = field(
+        default="",
+        validator=validators.instance_of(str),
+        )
+    cpus_per_task: int = field(
+        default=1,
+        validator=validators.instance_of(int),
+    )
+    n_gpus: int = field(
+        default=1,
+        validator=validators.instance_of(int),
+    )
+    mps: int = field(
+        default=1,
+        validator=validators.instance_of(int),
+    )
+    max_time_limit: str = field(
+        default="48:00:00",
+        validator=validators.instance_of(str),
+    )
+    worker_init: str = field(
+        default="",
+        validator=validators.instance_of(str),
+    )
+    remote_interface: (
+        Remote_interface_globus_compute_sdk
+        | Remote_interface_ssh
+        | Remote_interface_local_shell
+    ) = field(
+        default=Factory(Remote_interface_local_shell),
+    )
+    transfer_settings: (
+        Transfer_settings_rsync
+        | Transfer_settings_globus
+        | Transfer_settings_none
+    ) = field(
+        default=Factory(Transfer_settings_none),
+    )
+
+    def __attrs_post_init__(self) -> None:
+        _validate_local_shell_transfer_none(self)
+
+@define
+class Resource_remote_base(Resource_base):
+    """
+    Base class for remote resources.
+    """
+    pass
 
 @define
 class Resource_remote_slurm(Resource_remote_base):
@@ -304,7 +318,7 @@ class Resource_remote_slurm(Resource_remote_base):
         default=4,
         validator=validators.instance_of(int),
         )
-    time_limit: str = field(
+    max_time_limit: str = field(
         default="00:30:00",
         validator=validators.instance_of(str),
         )
@@ -376,7 +390,7 @@ class Resource_remote_pbs(Resource_remote_base):
         default=4,
         validator=validators.instance_of(int),
     )
-    time_limit: str = field(  # Format: HH:MM:SS (walltime)
+    max_time_limit: str = field(  # Format: HH:MM:SS (walltime)
         default="00:30:00",
         validator=validators.instance_of(str),
     )
@@ -478,7 +492,7 @@ class Resource_cloud_aws(Resource_cloud_base):
     transfer_settings: Transfer_settings_aws_s3 = field(
         default=Factory(Transfer_settings_aws_s3),
         )
-
+    
     def get_seekr_image_uri(self):
         return f"{self.account_id}.dkr.ecr.{self.region}.amazonaws.com/seekr-engines-bd:latest"
 
@@ -495,8 +509,7 @@ class Time_policy_fixed(Time_policy_base):
     """
     Always request a fixed walltime.
 
-    If ``time_limit`` is unset, resolve uses the Placement ``time_limit``
-    override if present, otherwise the Resource cap.
+    If ``time_limit`` is unset, use the Resource max_time_limit.
     """
     type: typing.Literal["fixed"] = "fixed"
     time_limit: str | None = field(
@@ -533,7 +546,7 @@ class Placement:
     """
     Deployment policy for stages whose address path begins with ``target``.
 
-    Compute fields (``cpus``, ``memory_mb``, ``time_limit``, ``mps``) are
+    Compute fields (``cpus``, ``memory_mb``, ``mps``) are
     backend-agnostic overrides. When unset, ``resolve_stage_execution`` fills
     them from the selected Resource's native defaults.
 
@@ -562,9 +575,6 @@ class Placement:
     memory_mb: int | None = field(
         default=None,
         validator=validators.optional(validators.instance_of(int)))
-    time_limit: str | None = field(
-        default=None,
-        validator=validators.optional(validators.instance_of(str)))
     mps: int | None = field(
         default=None,
         validator=validators.optional(validators.instance_of(int)))
@@ -577,9 +587,7 @@ class Placement:
 class Resolved_execution:
     """Fully-resolved, ready-to-run policy for one stage."""
     stage_name: str
-    # TODO: see if we can simplify to always using resource.name?
-    resource_name: str
-    resource: Resource_base | None
+    resource: Resource_base
     dispatch: stage_procedures_module.Dispatch
     co_schedule_with: str | None
     cpus: int | None
@@ -598,8 +606,7 @@ class Run_settings:
     """
     resources: typing.List[
         Resource_remote_slurm | Resource_remote_pbs | Resource_cloud_aws
-    ] = field(
-        default=Factory(list),)
+        ] = field(default=Factory(list),)
     # A placement with an empty ``target`` ([]) matches every stage and acts
     #  as the default; more specific (longer) targets override it.
     placements: list[Placement] = field(
@@ -617,11 +624,22 @@ class Run_settings:
         """
         Get a resource by its name.
         """
-        if resource_name == "local":
-            return None
         for resource in self.resources:
             if resource.name == resource_name:
                 return resource
+        if resource_name == "local":
+            resource = Resource_direct(
+                name="local",
+                cpus_per_task=1,
+                mps=1,
+                n_gpus=1,
+                max_time_limit="48:00:00",
+                remote_interface=Remote_interface_local_shell(),
+                transfer_settings=Transfer_settings_none(),
+            )
+            self.resources.append(resource)
+            return resource
+        
         raise ValueError(
             f"Resource with name '{resource_name}' not found in "
             f"run_settings.resources.")
@@ -640,19 +658,6 @@ class Run_settings:
                 placement.resource = resource_name
                 return
         self.placements.append(Placement(target=list(target), resource=resource_name))
-
-    
-
-    #def get_stage_resource(
-    #        self,
-    #        stage_name: str,
-    #        procedure: stage_procedures_module.Stage_procedure_base,
-    #        ) -> Resource_base | None:
-    #    """
-    #    Get the resource for a given stage (None means local).
-    #    """
-    #    return self.resolve_stage_execution(
-    #        stage_name, procedure).resource
 
 @define
 class Seekrflow:

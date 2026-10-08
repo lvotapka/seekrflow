@@ -166,7 +166,7 @@
                 "nodes_per_block": 1,
                 "cpus_per_task": 32,
                 "memory_per_node": 5000,
-                "time_limit": "48:00:00",
+                "max_time_limit": "48:00:00",
                 "scheduler_options": "--gpus-per-node=1 --gpu-bind=closest",
                 "worker_init": "source $HOME/.bashrc; conda activate SEEKR; nvidia-cuda-mps-control -d",
                 "remote_interface": {
@@ -191,7 +191,7 @@
                 "nodes_per_block": 1,
                 "cpus_per_task": 4,
                 "memory_per_node": 5000,
-                "time_limit": "00:30:00",
+                "max_time_limit": "00:30:00",
                 "scheduler_options": "--gres gpu:1 --gpus-per-node=1",
                 "worker_init": "module load modtree/gpu; conda activate SEEKR2",
                 "remote_interface": {
@@ -216,7 +216,7 @@
                 "nodes_per_block": 1,
                 "cpus_per_task": 32,
                 "memory_per_node": 64000,
-                "time_limit": "00:30:00",
+                "max_time_limit": "00:30:00",
                 "scheduler_options": "--gpus-per-node=1 --gpu-bind=closest",
                 "worker_init": "source /path/to/your/.bashrc; conda activate SEEKR2; export OPENMM_CUDA_COMPILER=/path/to/your/nvcc",
                 "remote_interface": {

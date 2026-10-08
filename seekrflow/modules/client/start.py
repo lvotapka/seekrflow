@@ -11,6 +11,7 @@ import seekr.modules.structures as seekr_structures
 
 import seekrflow.modules.structures as structures
 import seekrflow.modules.client.structures as client_structures
+import seekrflow.modules.client.validation as client_validation
 import seekrflow.modules.transfer.base as transfer_base
 
 def input_is_batch_file(input_json: str) -> bool:
@@ -37,6 +38,7 @@ def make_batch_from_single_seekrflow(
         max_concurrent_local_runs=client_structures.DEFAULT_MAX_CONCURRENT_LOCAL_RUNS,
         background_poll_interval=client_structures.DEFAULT_BACKGROUND_POLL_INTERVAL,
         focused_poll_interval=client_structures.DEFAULT_FOCUSED_POLL_INTERVAL,
+        telemetry_poll_interval=client_structures.DEFAULT_TELEMETRY_POLL_INTERVAL,
     )
     batch._existing_seekrflow = seekrflow_object
     return batch
@@ -98,12 +100,6 @@ def handle_benchmark_stage(
         raise ValueError(
             f"Unknown benchmark_stage {stage!r}. "
             f"Available stages: {all_stage_names}")
-    # TODO: more here? Old seekr_run.py check for DAG cycles (not necessary)
-    #  Also, old seekr_run.py checked if ancestors finished (also not necessary)
-    #  I would rather run all stages up to the benchmarked stage as well as the
-    #  benchmarked stage itself.
-    #  I think that if someone wanted to run a strict benchmark, they would 
-    #  accomplish this with two successive runs using semaphores.
     return stage
 
 def handle_force_rerun(
@@ -122,11 +118,6 @@ def handle_force_rerun(
     elif len(force_targets) == 0:
         force_rerun_stages = set(all_stage_names)
     else:
-        #unknown = [s for s in force_targets if s not in all_stage_names]
-        #if unknown:
-        #    raise ValueError(
-        #        f"Unknown stage(s) in force_targets: {unknown}. "
-        #        f"Available stages: {all_stage_names}")
         force_rerun_stages: set[str] = set()
         for fsys, fstage in force_targets:
             if not (fsys == system_name or fsys == "*"):
@@ -200,8 +191,11 @@ def transfer_unique_stage_resources(
     resources_by_name: dict[str, structures.Resource_remote_base] = {}
     for stage_name in stage_names:
         try:
-            resource = seekrflow.run_settings.get_stage_resource(
-                stage_name, seekrflow.workflow.procedure)
+            resource = client_validation.resolve_stage_execution(
+                seekrflow.run_settings,
+                stage_name,
+                seekrflow.workflow.procedure,
+            ).resource
         except ValueError:
             resource = None
         if resource is None:

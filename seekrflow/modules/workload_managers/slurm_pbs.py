@@ -88,8 +88,8 @@ def slurm_run_workload(args):
     def get_internal_id():
         """
         Since job IDs aren't assigned until the job is submitted, we need a way to
-        choose an internal, seekrflow-specific ID to use for Stage and Slurm Info
-        and State files. This can just be where the slurm runner directory
+        choose an internal, seekrflow-specific ID to use for Stage and Batch Info
+        and State files. This can just be where the batch runner directory
         has its content file names split by underscore and the ID is after the first
         underscore or something.
         """
@@ -97,7 +97,7 @@ def slurm_run_workload(args):
         if not batch_runner_dir.exists():
             return 0
         files = sorted(
-            batch_runner_dir.glob("*.json"),
+            batch_runner_dir.glob("batch_info_*.json"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -142,7 +142,6 @@ def slurm_run_workload(args):
         array_indices: Optional[list[int]] # The indices of the runs in the job array
         benchmark_mode: bool # Whether to run in benchmark mode
         filename: str
-        batch_state_filename: str
         stage_info_filenames: List[str] # Multiple stages possible in a bundled job
         stage_state_filenames: List[str]
         # Below: assigned when the job is submitted
@@ -243,7 +242,10 @@ def slurm_run_workload(args):
     LOG_DIR = "logs"
     log_dir_path = root_dir_path / LOG_DIR
     batch_info_basename = f"batch_info_{internal_id}.json"
-    batch_state_basename = f"batch_state_{internal_id}.json"
+    batch_state_basenames = []
+    for array_index in array_indices:
+        batch_state_basenames.append(f"batch_state_{internal_id}_{array_index}.json")
+
     stage_info_filenames = []
     stage_state_filenames = []
     stage_info_basenames = []
@@ -293,18 +295,20 @@ def slurm_run_workload(args):
         array_indices=array_indices,
         benchmark_mode=benchmark_mode,
         filename=batch_info_basename,
-        batch_state_filename=batch_state_basename,
         stage_info_filenames=stage_info_basenames,
         stage_state_filenames=stage_state_basenames,
     )
     batch_info.save(root_dir_path=root_dir_path, path=batch_info_basename)
-    batch_state = BatchState(
-        internal_id=internal_id,
-        filename=batch_state_basename,
-        batch_info_filename=batch_info_basename,
-        state="pending",
-    )
-    batch_state.save(root_dir_path=root_dir_path, path=batch_state_basename)
+    batch_states = []
+    for array_index, batch_state_basename in zip(array_indices, batch_state_basenames):
+        batch_state = BatchState(
+            internal_id=internal_id,
+            filename=batch_state_basename,
+            batch_info_filename=batch_info_basename,
+            state="pending",
+        )
+        batch_state.save(root_dir_path=root_dir_path, path=batch_state_basename)
+        batch_states.append(batch_state)
     
     starting_stage_infos = []
     starting_stage_states = []
@@ -422,9 +426,10 @@ def slurm_run_workload(args):
     batch_info.job_stderr_filenames = stderr_basenames
     batch_info.submitted_at = time.time()
     batch_info.save(root_dir_path=root_dir_path, path=batch_info_basename)
-    batch_state.state = "queued"
-    batch_state.last_timestamp = time.time()
-    batch_state.save(root_dir_path=root_dir_path, path=batch_state_basename)
+    for batch_state in batch_states:
+        batch_state.state = "queued"
+        batch_state.last_timestamp = time.time()
+        batch_state.save(root_dir_path=root_dir_path, path=batch_state.filename)
     return {"success": True, "error": None, "internal_id": internal_id, "job_id": job_id,
             "job_name": job_name}
 
@@ -716,16 +721,56 @@ def slurm_pbs_status_workload(args):
                 batch_state.save(root_dir_path=root_dir_path, path=batch_state_path.name)
                 batch_state_dict = asdict(batch_state)
                 batch_dicts_by_array_index[array_index] = batch_state_dict
-
+            
+            list_fields = (
+                "stage_anchor_swarm_progress_list",
+                "stage_anchor_swarm_starting_step_list",
+                "stage_anchor_swarm_current_step_list",
+                "stage_anchor_swarm_total_steps_list",
+                "stage_anchor_swarm_time_of_first_progress_list",
+                "stage_anchor_swarm_time_of_last_progress_list",
+            )
             stage_dicts_by_stage_index = {}
             for stage_index in stage_indices:
-                #stage_info_filename = stage_dir_path / f"stage_info_{internal_id}_{stage_index}.json"
-                stage_state_filename = stage_dir_path / f"stage_state_{internal_id}_{stage_index}.json"
-                #stage_info_dicts.append(parse_json_file_to_dict(stage_info_filename))
-                stage_state_dict = parse_json_file_to_dict(stage_state_filename)
-                stage_dicts_by_stage_index[stage_index] = stage_state_dict
+                member_dicts = []
+                for array_index in array_indices:
+                    stage_state_filename = stage_dir_path \
+                        / f"stage_state_{internal_id}_{stage_index}_{array_index}.json"
+                    if not stage_state_filename.exists():
+                        member_dicts.append({"state": "unstarted", "finished": False})
+                        continue
+                    member_dicts.append(parse_json_file_to_dict(stage_state_filename))
+                
+                states = [member.get("state") or "unstarted" for member in member_dicts]
+                if "error" in states:
+                    state = "error"
+                elif states and all(member_state == "completed" for member_state in states):
+                    state = "completed"
+                elif any(member_state in ("started", "completed") for member_state in states):
+                    state = "started"
+                else:
+                    state = "unstarted"
+                
+                merged = {
+                    "internal_id": internal_id,
+                    "state": state,
+                    "finished": all(bool(member.get("finished")) for member in member_dicts),
+                }
+                for field in list_fields:
+                    combined = []
+                    for member in member_dicts:
+                        combined.extend(member.get(field) or [])
+                    merged[field] = combined or None
+                timestamps = [
+                    member.get("latest_timestamp") 
+                    for member in member_dicts
+                    if member.get("latest_timestamp") is not None
+                ]
+                merged["latest_timestamp"] = max(timestamps) if timestamps else None
+                stage_dicts_by_stage_index[stage_index] = merged
+
             job_dicts_by_job_id[job_id] = {
-                "batch_dicts_by_array_index": batch_dicts_by_array_index,
+                "manager_dicts_by_array_index": batch_dicts_by_array_index,
                 "stage_dicts_by_stage_index": stage_dicts_by_stage_index,
             }
     
@@ -768,9 +813,7 @@ def slurm_pbs_cancel_workload(args):
                 filepath.unlink()
     
     incoming_payload = args[0]
-    #scheduler = args[1]
     scheduler = incoming_payload["scheduler"]
-    #remove_json_files = args[2] if len(args) > 2 else False
     remove_json_files = incoming_payload["remove_json_files"]
     
     for system_name, payload in incoming_payload["system_payloads"].items():

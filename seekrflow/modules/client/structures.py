@@ -22,16 +22,10 @@ import seekrflow.modules.structures as structures
 Seekrflow = structures.Seekrflow
 
 DEFAULT_BACKGROUND_POLL_INTERVAL = 300.0
+DEFAULT_TELEMETRY_POLL_INTERVAL = 30.0
 DEFAULT_FOCUSED_POLL_INTERVAL = 5.0
 DEFAULT_MAX_CONCURRENT_LOCAL_RUNS = 1
 SEEKRFLOW_JSON_NAME = "seekrflow.json"
-
-#@define
-#class StagePlan:
-#    """
-#    A plan for a single stage: names, dependencies, resource, force, benchmark.
-#    """
-#    ...
 
 @define
 class SystemRun:
@@ -44,12 +38,13 @@ class SystemRun:
     semaphore_dict: Dict[str, str] = field(validator=validators.instance_of(dict))
     force_rerun_stages: List[str] = field(validator=validators.instance_of(list))
     benchmark_stage: str | None = field(validator=validators.optional(validators.instance_of(str))) # TODO: move to stage plan?
-    #transferred_resources: List[str] = field(validator=validators.instance_of(list))
-    #perform_final_transfer: bool = field(validator=validators.instance_of(bool))
-    #stage_plans: List[StagePlan] = field(
-    #    factory=list,
-    #    validator=validators.instance_of(list),
-    #)
+    telemetry_poll_interval: float = field(
+        default=DEFAULT_TELEMETRY_POLL_INTERVAL,
+        validator=validators.and_(
+            validators.instance_of(float),
+            validators.gt(0.0),
+        ),
+    )
 
 @define
 class RunSession:
@@ -91,8 +86,16 @@ class RunSession:
             validators.gt(0.0),
         ),
     )
+    telemetry_poll_interval: float = field(
+        default=DEFAULT_TELEMETRY_POLL_INTERVAL,
+        validator=validators.and_(
+            validators.instance_of(float),
+            validators.gt(0.0),
+        ),
+    )
 
-# TODO: put this somewhere else? Used by Batch objects
+# TODO: put this somewhere else? Used by Batch objects which are used in
+#  prepare and analyze stages as well as the client run
 def deep_merge(
         base: typing.Any, 
         override: typing.Any
@@ -207,6 +210,13 @@ class Batch:
             validators.gt(0.0),
         ),
     )
+    telemetry_poll_interval: float = field(
+        default=DEFAULT_TELEMETRY_POLL_INTERVAL,
+        validator=validators.and_(
+            validators.instance_of(float),
+            validators.gt(0.0),
+        ),
+    )
     # TODO: implement
     batch_analyses: list[typing.Any] = field(
         factory=list,
@@ -238,8 +248,8 @@ class Batch:
             data = json.load(f)
         converter = cattrs.Converter()
         batch: "Batch" = converter.structure(data, cls)
-        batch._source_path = batch_json
-        batch._source_dir = os.path.dirname(batch_json)
+        batch._source_path = os.path.abspath(batch_json)
+        batch._source_dir = os.path.dirname(batch._source_path)
         names = [s.name for s in batch.systems]
         if len(names) != len(set(names)):
             raise ValueError(f"Duplicate system names in batch: {names}")
@@ -255,9 +265,7 @@ class Batch:
             raise TypeError(
                 f"batch template must be a path string or dict, got "
                 f"{type(self.template)}")
-        template_path = self.template
-        if not os.path.isabs(template_path):
-            template_path = os.path.abspath(template_path)
+        template_path = self._template_path_resolved()
         with open(template_path, "r") as f:
             template_dict = json.load(f)
         return template_dict
@@ -310,7 +318,18 @@ class Batch:
         produce the list of seekrflow objects for all systems in this batch
         """
         return [self.materialize_one(system) for system in self.systems]
-
+    
+    def create_seekrflow_objects(self) -> List[Seekrflow]:
+        """
+        Create a list of seekrflow objects for all systems in this batch.
+        """
+        if self.batch_directory is not None:
+            seekrflow_objects=self.materialize_all()
+        else:
+            seekrflow_objects=[self._existing_seekrflow] \
+                if self._existing_seekrflow else []
+        return seekrflow_objects
+    
     def create_session(
             self,
             output_file: str | None,
@@ -319,11 +338,7 @@ class Batch:
         """
         Create a RunSession from this Batch.
         """
-        if self.batch_directory is not None:
-            seekrflow_objects=self.materialize_all()
-        else:
-            seekrflow_objects=[self._existing_seekrflow] \
-                if self._existing_seekrflow else []
+        seekrflow_objects = self.create_seekrflow_objects()
         systemrun_objects = []
         curdir = os.getcwd()
         for seekrflow in seekrflow_objects:
@@ -332,6 +347,11 @@ class Batch:
                 os.chdir(seekrflow.work_directory)
             root_directory = str(seekrflow.get_root_directory())
             model_filename = os.path.join(root_directory, "model.json")
+            if not os.path.isfile(model_filename):
+                raise FileNotFoundError(
+                    f"No prepared model for system {seekrflow.name!r}: "
+                    f"{model_filename} does not exist. Run prepare for this "
+                    f"batch before client.py run.")
             model = seekr_structures.load_model(model_filename)
             systemrun_objects.append(SystemRun(
                 name=seekrflow.name,
@@ -340,6 +360,7 @@ class Batch:
                 semaphore_dict={},
                 force_rerun_stages=[],
                 benchmark_stage=None,
+                telemetry_poll_interval=self.telemetry_poll_interval,
                 #stage_plans=[],
             ))
             os.chdir(curdir)
@@ -352,4 +373,5 @@ class Batch:
             max_concurrent_local_runs=self.max_concurrent_local_runs,
             background_poll_interval=self.background_poll_interval,
             focused_poll_interval=self.focused_poll_interval,
+            telemetry_poll_interval=self.telemetry_poll_interval,
         )
