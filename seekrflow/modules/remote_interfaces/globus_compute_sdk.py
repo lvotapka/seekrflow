@@ -134,27 +134,24 @@ def submit_remote_workload_with_globus_compute(
             )
     
     args = [manager_payload]
-    def submit_once() -> dict:
-        gcx = Executor(endpoint, client=c)
+    gcx = Executor(endpoint, client=c)
+    try:
+        gcx.serializer = ComputeSerializer(strategy_code=CombinedCode())
+        function_id = _get_function_id(gcx, endpoint, workload)
+        future = gcx.submit_to_registered_function(
+            function_id=function_id, args=(args,))
         try:
-            gcx.serializer = ComputeSerializer(strategy_code=CombinedCode())
-            function_id = _get_function_id(gcx, endpoint, workload)
-            future = gcx.submit_to_registered_function(
-                function_id=function_id, args=(args,))
-            try:
-                return future.result(timeout=GLOBUS_RESULT_TIMEOUT_S)
-            except TimeoutError as e:
-                raise TimeoutError(
-                    f"Globus Compute task on endpoint {resource_name!r} "
-                    f"exceeded {GLOBUS_RESULT_TIMEOUT_S:.0f}s waiting for a "
-                    f"result; will retry on the next poll"
-                ) from e
-        except Exception as error:
-            # A stale or deleted function ID: re-register on the next try.
-            if getattr(error, "http_status", None) in (403, 404):
-                _forget_function_id(endpoint, workload)
-            raise
-        finally:
-            gcx.shutdown(wait=False, cancel_futures=True)
-
-    return submit_once()
+            return future.result(timeout=GLOBUS_RESULT_TIMEOUT_S)
+        except TimeoutError as e:
+            raise TimeoutError(
+                f"Globus Compute task on endpoint {resource_name!r} "
+                f"exceeded {GLOBUS_RESULT_TIMEOUT_S:.0f}s waiting for a "
+                f"result; will retry on the next poll"
+            ) from e
+    except Exception as error:
+        # A stale or deleted function ID: re-register on the next try.
+        if getattr(error, "http_status", None) in (403, 404):
+            _forget_function_id(endpoint, workload)
+        raise
+    finally:
+        gcx.shutdown(wait=False, cancel_futures=True)

@@ -76,13 +76,11 @@ def volatile_exclude_globs() -> list[str]:
     runs, which is what produced checksum failures and FILE_NOT_FOUND on
     otherwise-complete remote trees.
     """
-    from seekrflow.modules.run_lock import RUN_LOCK_FILENAME
     from seekrflow.modules.transfer.aws_s3 import LOCAL_RUNNER_DIRNAMES
 
     return [
         STATUS_FILE_NAME,
         STATUS_TMP_GLOB,
-        RUN_LOCK_FILENAME,
         *LOCAL_RUNNER_DIRNAMES,
     ]
 
