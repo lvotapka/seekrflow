@@ -351,7 +351,8 @@ def await_transfer_task(
                     f"globus-transfer: task {task_id} ({label}) cancelled")
             finished = transfer_client.task_wait(
                 task_id, timeout=poll_interval, polling_interval=poll_interval)
-            task = dict(transfer_client.get_task(task_id))
+            raw = transfer_client.get_task(task_id)
+            task = dict(raw if isinstance(raw, dict) else raw.data)
         except Exception as e:
             classified = wrap_transfer_exception(e)
             if not isinstance(classified, GlobusTransferRetryableError):

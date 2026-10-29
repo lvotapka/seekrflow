@@ -1005,10 +1005,14 @@ class SeekrPipeline:
                     if self.detached_requested or stop_event.is_set():
                         all_terminal = True
                         break
-                    
+                    task_busy = (
+                        stage_workflow.task is not None
+                        and not stage_workflow.task.done()
+                    )
                     if stage_workflow in held_slots and (
                             stage_workflow.is_terminal()
                             or (stage_workflow.semaphore == "wait"
+                                and not task_busy
                                 and not stage_workflow.has_running_task_or_process())):
                         release_slot(stage_workflow)
 
